@@ -92,6 +92,11 @@ def _ensure_monitor_running() -> None:
 def _monitor_loop() -> None:
     while True:
         time.sleep(60)
+        try:
+            fd_count = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        except Exception:
+            fd_count = -1
+
         with _pool_lock:
             count = len(_containers)
             at_limit = count >= SANDBOX_MAX_CONTAINERS
@@ -100,9 +105,21 @@ def _monitor_loop() -> None:
                 for info in _containers.values()
                 if time.time() - info["last_used"] > SANDBOX_IDLE_TIMEOUT
             )
+
+        if fd_count > 400:
+            print(
+                f"[docker_backend] CRITICAL: FD count={fd_count} — approaching limit, shutting down to prevent cascade"
+            )
+            import atexit
+
+            atexit._run_exitfuncs()
+            import os as _os
+
+            _os.kill(_os.getpid(), 9)
+
         level = "WARNING" if at_limit or stale_count > 0 else "INFO"
         print(
-            f"[docker_backend] Pool status: {count}/{SANDBOX_MAX_CONTAINERS} containers, {stale_count} stale (idle > {SANDBOX_IDLE_TIMEOUT}s)"
+            f"[docker_backend] Pool status: {count}/{SANDBOX_MAX_CONTAINERS} containers, {stale_count} stale, fd={fd_count}"
         )
         if at_limit:
             print(
