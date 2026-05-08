@@ -172,7 +172,9 @@ def _get_or_create_container(session_id: str, workspace: str = None) -> tuple:
         stderr = result.stderr.strip()
         if 'already in use' in stderr or 'Conflict' in stderr:
             print(f'[docker_backend] Stale container found for {name} — removing and retrying')
-            _docker('rm', '-f', name)
+            rm_result = _docker('rm', '-f', name)
+            if rm_result.returncode != 0:
+                print(f'[docker_backend] WARNING: failed to remove stale container {name}: {rm_result.stderr.strip()}')
             result = _docker(*cmd)
 
     if result.returncode != 0:
@@ -202,6 +204,9 @@ def _destroy_container(session_id: str) -> dict:
     result = _docker('rm', '-f', container_id)
     if result.returncode == 0:
         return {'result': 'container_destroyed', 'container_id': container_id[:12]}
+    print(f'[docker_backend] WARNING: docker rm failed for {container_id[:12]}: {result.stderr.strip()} - re-adding to pool')
+    with _pool_lock:
+        _containers[session_id] = info
     return {'error': f'docker rm failed: {result.stderr.strip()}'}
 
 
