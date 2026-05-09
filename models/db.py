@@ -49,14 +49,14 @@ class Database(
         handles transactions but does not close, so the connection stays
         alive for the lifetime of the thread.
         """
-        conn = getattr(self._tlocal, 'conn', None)
-        if conn is None:
-            conn = sqlite3.connect(self.db_path, timeout=10)
-            conn.execute("PRAGMA busy_timeout = 10000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            self._tlocal.conn = conn
-        # Reset shared mutable state so every "borrow" starts clean
-        conn.row_factory = None
+        existing = getattr(self._tlocal, "conn", None)
+        if existing is not None:
+            existing.row_factory = None
+            return existing
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute("PRAGMA busy_timeout = 10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        self._tlocal.conn = conn
         return conn
 
 
