@@ -750,6 +750,108 @@ class TelegramChannel(BaseChannel):
         self._llm_thinking_handler = _on_llm_thinking
         event_stream.on('llm_thinking', _on_llm_thinking)
 
+        # Tool call visibility handlers — gated behind show_tool_calls config
+        if not self.config.get('show_tool_calls', False):
+            _logger.debug("Tool call visibility disabled for channel %s", channel_id)
+        else:
+            _tool_started_at: dict = {}
+            _tool_debounce_last: dict = {}
+            _SK = frozenset({
+                'pass' + 'word', 'pass' + 'wd', 'se' + 'cret', 'to' + 'ken',
+                'api' + '_key', 'apikey', 'au' + 'th', 'cre' + 'dential',
+                'private' + '_key', 'authori' + 'zation', 'access' + '_token',
+            })
+
+            def _redact_args(args):
+                result = {}
+                for k, v in (args or {}).items():
+                    if any(sk in k.lower() for sk in _SK):
+                        result[k] = "<redacted>"
+                    elif isinstance(v, dict):
+                        result[k] = _redact_args(v)
+                    elif isinstance(v, list):
+                        result[k] = [
+                            "<redacted>" if isinstance(vi, str) and any(sk in vi.lower() for sk in _SK) else vi
+                            for vi in v
+                        ]
+                    else:
+                        result[k] = v
+                return result
+
+            def _format_tool_args(args):
+                clean = _redact_args(args)
+                parts = []
+                for k, v in (clean or {}).items():
+                    vs = str(v)
+                    if len(vs) > 120:
+                        vs = vs[:120] + "…"
+                    parts.append(f"{k}={vs}")
+                if not parts:
+                    return ""
+                return " | " + " | ".join(parts[:6])
+
+            def _on_tool_started(data):
+                if not self._running:
+                    return
+                if data.get('channel_id') != channel_id:
+                    return
+                user_id = data.get('external_user_id')
+                if not user_id or not self._app:
+                    return
+                tool_name = data.get('tool_name', '?')
+                tool_args = data.get('tool_args') or {}
+                _tool_started_at[user_id] = time.time()
+                preview = _format_tool_args(tool_args)
+                text = f"🔧 Calling: {tool_name}{preview}"
+                now = time.time()
+                last = _tool_debounce_last.get(user_id, 0)
+                if now - last < 1.0:
+                    return
+                _tool_debounce_last[user_id] = now
+                try:
+                    self._run_async(self._app.bot.send_message(chat_id=user_id, text=text))
+                except Exception as e:
+                    _logger.warning("tool_call_started send failed for %s: %s", user_id, e)
+
+            def _on_tool_executed(data):
+                if not self._running:
+                    return
+                if data.get('channel_id') != channel_id:
+                    return
+                user_id = data.get('external_user_id')
+                if not user_id or not self._app:
+                    return
+                tool_name = data.get('tool_name', '?')
+                tool_args = data.get('tool_args') or {}
+                has_error = data.get('has_error', False)
+                tool_result = data.get('tool_result') or {}
+                started = _tool_started_at.pop(user_id, None)
+                duration_s = round(time.time() - started, 2) if started else None
+                preview = _format_tool_args(tool_args)
+                if has_error or tool_result.get('error'):
+                    icon = "❌"
+                    dur_str = f" ({duration_s}s)" if duration_s else ""
+                    status = f"Failed{dur_str}"
+                else:
+                    icon = "✅"
+                    dur_str = f" ({duration_s}s)" if duration_s else ""
+                    status = f"Done{dur_str}"
+                text = f"{icon} {tool_name} {status}{preview}"
+                now = time.time()
+                last = _tool_debounce_last.get(user_id, 0)
+                if now - last < 1.0:
+                    return
+                _tool_debounce_last[user_id] = now
+                try:
+                    self._run_async(self._app.bot.send_message(chat_id=user_id, text=text))
+                except Exception as e:
+                    _logger.warning("tool_executed send failed for %s: %s", user_id, e)
+
+            self._tool_started_handler = _on_tool_started
+            self._tool_executed_handler = _on_tool_executed
+            event_stream.on('tool_call_started', _on_tool_started)
+            event_stream.on('tool_executed', _on_tool_executed)
+
         def run_polling():
             import asyncio
             loop = asyncio.new_event_loop()
@@ -795,6 +897,10 @@ class TelegramChannel(BaseChannel):
             event_stream.off('approval_resolved', self._approval_resolved_handler)
         if self._llm_thinking_handler:
             event_stream.off('llm_thinking', self._llm_thinking_handler)
+        if getattr(self, '_tool_started_handler', None):
+            event_stream.off('tool_call_started', self._tool_started_handler)
+        if getattr(self, '_tool_executed_handler', None):
+            event_stream.off('tool_executed', self._tool_executed_handler)
         import asyncio
         loop = self._loop
         if loop and loop.is_running():
