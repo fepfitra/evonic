@@ -110,6 +110,27 @@ class UsageDB:
     def _since_clause(since: Optional[str]) -> tuple:
         return (" WHERE created_at >= ?", (since,)) if since else ("", ())
 
+    def agent_total_tokens(self, agent_id: str, since_iso: Optional[str] = None) -> Optional[int]:
+        """Sum total_tokens for one agent since a given ISO timestamp (UTC).
+
+        Returns None on any error so callers can fail open. Used by the
+        per-agent daily token limiter (backend/agent_runtime/runtime.py).
+        """
+        try:
+            if since_iso:
+                where, params = " AND created_at >= ?", (since_iso,)
+            else:
+                where, params = "", ()
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"SELECT COALESCE(SUM(total_tokens), 0) AS total FROM token_usage "
+                    f"WHERE agent_id = ?{where}",
+                    (agent_id, *params),
+                ).fetchone()
+                return int(row['total']) if row else 0
+        except Exception:
+            return None
+
     def overall_totals(self, since: Optional[str] = None) -> Dict[str, Any]:
         where, params = self._since_clause(since)
         with self._connect() as conn:
