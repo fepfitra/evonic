@@ -290,6 +290,14 @@ def create_blueprint():
         # --- Call agent ---
         from backend.agent_runtime import agent_runtime
 
+        # A message sent while the agent is mid-turn is injected into the
+        # running loop, and this endpoint answers `content: null` — an empty
+        # success the caller cannot tell from a silent agent. Refuse it with
+        # something actionable instead: 409, so a client can queue the message
+        # and retry when the turn ends (PIT-254).
+        if agent_runtime.is_agent_busy(agent_id):
+            return jsonify({'error': 'agent busy', 'session': external_user_id}), 409
+
         if stream:
             return _stream_response(token_row, agent_id, external_user_id,
                                     user_message, model, model_agent_map)
