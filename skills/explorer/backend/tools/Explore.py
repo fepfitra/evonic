@@ -9,12 +9,16 @@ import json
 import posixpath
 import logging
 import threading
+import time
 
 _logger = logging.getLogger(__name__)
 
 # Limits mirror agent_messaging.injected_system_vars validation.
 _MAX_CONTEXT_VARS = 10
 _MAX_VAR_VALUE_LEN = 1024
+
+# How often the sync wait re-checks the caller's /stop flag.
+_STOP_POLL_INTERVAL = 0.25
 
 EXPLORER_TASK_DIRECTIVE = (
     "You are an explorer sub-agent. Your tools are confined to the target directory.\n"
@@ -41,6 +45,29 @@ def _sanitize_context_vars(raw) -> tuple:
             return None, f"context_vars['{key}'] exceeds {_MAX_VAR_VALUE_LEN} characters."
         clean[key] = val
     return clean, None
+
+
+def _wait_for_explorer(done: threading.Event, timeout: int,
+                       parent_session_id: str) -> str:
+    """Block until the explorer finishes, the caller /stops, or timeout.
+
+    Polls instead of a single ``done.wait(timeout)`` so a /stop on the caller's
+    session — which the explorer's ``final_answer`` event never signals — is
+    noticed within ``_STOP_POLL_INTERVAL`` rather than after the full timeout.
+
+    Returns 'done', 'stopped', or 'timeout'.
+    """
+    from backend.agent_runtime import agent_runtime
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if done.wait(timeout=max(0.0, min(_STOP_POLL_INTERVAL, remaining))):
+            return 'done'
+        if parent_session_id and agent_runtime.is_stop_requested(parent_session_id):
+            return 'stopped'
+        if time.monotonic() >= deadline:
+            return 'timeout'
 
 
 def execute(agent: dict, args: dict) -> dict:
@@ -136,14 +163,31 @@ def execute(agent: dict, args: dict) -> dict:
     except ValueError as e:
         return {'error': str(e)}
 
+    sync = bool(skill_cfg.get('sync', False))
+    done = threading.Event()
+    answer_data = {}
+    event_stream = None
+    _on_explorer_done = None
+    if sync:
+        from backend.event_stream import event_stream
+
+        def _on_explorer_done(data):
+            if data.get('agent_id') == explorer_id:
+                answer_data['answer'] = data.get('answer', '')
+                answer_data['tool_trace'] = data.get('tool_trace', [])
+                answer_data['error'] = data.get('error', False)
+                done.set()
+
+        # Register before dispatch: a fast explorer can otherwise finish and emit
+        # final_answer before this caller begins observing completion.
+        event_stream.on('final_answer', _on_explorer_done)
+
     parent_name = parent_agent.get('name', parent_id)
     report_to_id, report_to_channel_id, _ = resolve_report_to_for_subagent_spawn(
         parent_id,
         agent.get('user_id', ''),
         agent.get('channel_id', '') or '',
     )
-
-    sync = bool(skill_cfg.get('sync', False))
 
     metadata = {
         'agent_message': True,
@@ -169,6 +213,14 @@ def execute(agent: dict, args: dict) -> dict:
         metadata=metadata,
     )
 
+    if sync and not result.get('success'):
+        event_stream.off('final_answer', _on_explorer_done)
+        return {
+            'error': f"Failed to dispatch explorer task: {result.get('reason', 'unknown')}",
+            'explorer_id': explorer_id,
+            'path': path,
+        }
+
     session_id = result.get('session_id')
 
     _logger.info(
@@ -178,13 +230,8 @@ def execute(agent: dict, args: dict) -> dict:
 
     # --- Sync mode: block until the explorer finishes and return findings directly ---
     if sync:
-        if not result.get('success'):
-            return {
-                'error': f"Failed to dispatch explorer task: {result.get('reason', 'unknown')}",
-                'explorer_id': explorer_id,
-                'path': path,
-            }
         if not session_id:
+            event_stream.off('final_answer', _on_explorer_done)
             return {
                 'error': 'Explorer dispatched but no session allocated. Cannot track completion.',
                 'explorer_id': explorer_id,
@@ -192,27 +239,38 @@ def execute(agent: dict, args: dict) -> dict:
             }
 
         timeout = int(skill_cfg.get('timeout', 300))
-        done = threading.Event()
-        answer_data = {}
 
-        from backend.event_stream import event_stream
         from backend.agent_runtime.concurrency import paused_model_gate
-
-        def _on_explorer_done(data):
-            if data.get('agent_id') == explorer_id:
-                answer_data['answer'] = data.get('answer', '')
-                answer_data['tool_trace'] = data.get('tool_trace', [])
-                answer_data['error'] = data.get('error', False)
-                done.set()
-
-        event_stream.on('final_answer', _on_explorer_done)
 
         try:
             # Release our turn's model-gate while blocked so the explorer (which needs
             # the same gate) can run — otherwise parent↔explorer deadlock until timeout.
             with paused_model_gate():
-                finished = done.wait(timeout=timeout)
-            if not finished:
+                outcome = _wait_for_explorer(
+                    done, timeout, agent.get('session_id') or '')
+
+            if outcome == 'stopped':
+                # Propagate the caller's /stop into the explorer's OWN session:
+                # sets its stop event and kills its running tool subprocess, so it
+                # halts instead of exploring on for a caller that is already gone.
+                from backend.agent_runtime import agent_runtime
+                agent_runtime.request_stop(session_id)
+                _logger.info(
+                    "Explore stopped by user — propagated stop to explorer %s (session=%s)",
+                    explorer_id, session_id,
+                )
+                return {
+                    'explorer_id': explorer_id,
+                    'path': path,
+                    'stopped': True,
+                    'error': (
+                        "Exploration stopped by user request. The explorer was "
+                        "stopped as well and returned no findings."
+                    ),
+                    'session_id': session_id,
+                }
+
+            if outcome == 'timeout':
                 return {
                     'explorer_id': explorer_id,
                     'path': path,

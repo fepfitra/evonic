@@ -12,10 +12,13 @@ import sys
 import glob
 import json
 import types
+import logging
 import threading
 import importlib
 import importlib.util
 from typing import Dict, Any, Optional, Callable, List
+
+_logger = logging.getLogger(__name__)
 
 # Directory containing tool backend Python files
 TOOLS_DIR = os.path.join(os.path.dirname(__file__))
@@ -46,9 +49,6 @@ class ToolRegistry:
         self._builtins['builtin:set_mode'] = _builtin_set_mode_factory
         self._builtins['builtin:update_tasks'] = _builtin_update_tasks_factory
         self._builtins['builtin:save_plan'] = _builtin_save_plan_factory
-        # ATG task-graph compiler — exposed only when agent_context['enable_atg']
-        # (see get_builtin_tools gate)
-        self._builtins['builtin:compile_task_graph'] = _builtin_compile_task_graph_factory
         # CMP session-path navigation — exposed only when agent_context['enable_cmp']
         self._builtins['builtin:switch_path'] = _builtin_switch_path_factory
         self._builtins['builtin:new_path'] = _builtin_new_path_factory
@@ -64,6 +64,8 @@ class ToolRegistry:
         self._builtins['builtin:recall_sessions'] = _builtin_recall_sessions_factory
         # Tool to clear active fallback flag from agent_state (agent calls this)
         self._builtins['builtin:reset_active_model'] = _builtin_reset_active_model_factory
+        # Opt-in: lets the agent move itself between workplaces (agents.workplace_switch_enabled)
+        self._builtins['builtin:switch_workplace'] = _builtin_switch_workplace_factory
 
     def _compute_json_mtimes(self) -> Optional[tuple]:
         """Return a tuple of (path, mtime) for every tools/*.json file.
@@ -200,6 +202,14 @@ class ToolRegistry:
                         for tid in _assigned
                     )
                     if not _namespaced_match:
+                        _logger.warning(
+                            "Authorization guard blocked tool '%s' for agent '%s' "
+                            "(session=%s user=%s): tool is not in assigned_tool_ids",
+                            function_name,
+                            ctx.get('agent_id', '?'),
+                            ctx.get('session_id', '?'),
+                            ctx.get('user_id', '?'),
+                        )
                         return {
                             "error": (
                                 f"Tool '{function_name}' is not assigned to this agent. "
@@ -244,6 +254,10 @@ class ToolRegistry:
                 return {"error": f"Tool backend '{function_name}' missing execute() function"}
             # Propagate live flags from agent_context (e.g. _skip_safety set after approval)
             ctx['_skip_safety'] = agent_context.get('_skip_safety', False)
+            # switch_workplace moves the agent mid-turn: later tool calls must follow it.
+            ctx['workplace_id'] = agent_context.get('workplace_id')
+            if 'workspace' in agent_context:
+                ctx['workspace'] = agent_context.get('workspace')
             try:
                 return module.execute(ctx, arguments)
             except Exception as e:
@@ -256,11 +270,11 @@ class ToolRegistry:
         """Return whether a feature-gated built-in is available to an agent."""
         if builtin_id in ('builtin:save_plan', 'builtin:set_mode', 'builtin:state'):
             return not bool(agent_context.get('always_execute'))
-        if builtin_id == 'builtin:compile_task_graph':
-            return bool(agent_context.get('enable_atg'))
         if builtin_id in ('builtin:switch_path', 'builtin:new_path',
                           'builtin:read_transcript', 'builtin:forget_memory'):
             return bool(agent_context.get('enable_cmp'))
+        if builtin_id == 'builtin:switch_workplace':
+            return bool(agent_context.get('workplace_switch_enabled'))
         return True
 
     def get_builtin_tool_defs(self, agent_context: Optional[dict] = None) -> List[Dict[str, Any]]:
@@ -329,6 +343,7 @@ class ToolRegistry:
         """
         tool_path = os.path.join(TOOLS_DIR, f"{tool_name}.py")
         skill_backend_dir = None
+        skill_owner = skill_id  # skill ID owning the resolved backend
         plugin_owner = None  # plugin_id owning the resolved backend
 
         # If skill_id is specified, search that skill first
@@ -340,6 +355,7 @@ class ToolRegistry:
                 skill_dir = skills_manager.find_tool_skill_dir(tool_name, skill_id=skill_id)
                 if skill_dir:
                     skill_backend_dir = os.path.join(skill_dir, 'backend')
+                    skill_owner = skill_id
             # Fall through to default search if not found in specified skill
         elif plugin_id:
             from backend.plugin_manager import plugin_manager
@@ -358,6 +374,7 @@ class ToolRegistry:
                 skill_dir = skills_manager.find_tool_skill_dir(tool_name)
                 if skill_dir:
                     skill_backend_dir = os.path.join(skill_dir, 'backend')
+                    skill_owner = os.path.basename(skill_dir)
             else:
                 from backend.plugin_manager import plugin_manager
                 p_path, p_owner = plugin_manager.find_plugin_tool_backend(tool_name)
@@ -369,8 +386,8 @@ class ToolRegistry:
         current_mtime = os.path.getmtime(tool_path)
         if plugin_owner:
             cache_key = f"{tool_name}:plugin:{plugin_owner}"
-        elif skill_id:
-            cache_key = f"{tool_name}:{skill_id}"
+        elif skill_owner:
+            cache_key = f"{tool_name}:skill:{skill_owner}"
         else:
             cache_key = tool_name
         cached = self._module_cache.get(cache_key)
@@ -382,18 +399,25 @@ class ToolRegistry:
             module = self._exec_plugin_tool_module(
                 plugin_owner, os.path.dirname(tool_path), tool_name, tool_path)
         elif skill_backend_dir:
-            # Skill tools: use a unique namespace (like plugin_tools_{plugin_id})
-            # so relative imports (from ._utils import ...) resolve against the
-            # skill's own backend/tools/ dir, not the main backend/tools/ package.
-            pkg_name = f"skill_tools_{skill_id}"
+            # Skill tools use backend as their package root, so relative imports
+            # can reach sibling packages such as ``..providers``.
+            pkg_name = f"skill_tools_{skill_owner.replace('-', '_')}"
             pkg = sys.modules.get(pkg_name)
             if pkg is None:
                 pkg = types.ModuleType(pkg_name)
                 pkg.__package__ = pkg_name
                 sys.modules[pkg_name] = pkg
-            pkg.__path__ = [os.path.dirname(tool_path)]
+            pkg.__path__ = [skill_backend_dir]
 
-            mod_name = f"{pkg_name}.{tool_name}"
+            tools_pkg_name = f"{pkg_name}.tools"
+            tools_pkg = sys.modules.get(tools_pkg_name)
+            if tools_pkg is None:
+                tools_pkg = types.ModuleType(tools_pkg_name)
+                tools_pkg.__package__ = tools_pkg_name
+                sys.modules[tools_pkg_name] = tools_pkg
+            tools_pkg.__path__ = [os.path.dirname(tool_path)]
+
+            mod_name = f"{tools_pkg_name}.{tool_name}"
             spec = importlib.util.spec_from_file_location(mod_name, tool_path)
             module = importlib.util.module_from_spec(spec)
             sys.modules[mod_name] = module
@@ -583,7 +607,13 @@ def _builtin_update_tasks_factory(agent_context: dict):
             "name": "update_tasks",
             "description": (
                 "Manage your implementation task list "
-                "(set, add, update status, remove). CRITICAL: Each entry must be "
+                "(set, add, update status, remove).\n"
+                "WHEN TO CALL (mandatory bookkeeping): 'set' the list before "
+                "starting multi-step work; 'in_progress' when you begin a task; "
+                "'done' the moment a task's work is finished — always BEFORE "
+                "giving your final answer. Never end a turn that did "
+                "implementation work without reconciling task statuses.\n"
+                "CRITICAL: Each entry must be "
                 "ATOMIC — exactly one concrete action or outcome that can be "
                 "completed independently. Split multi-action work into separate "
                 "entries; never batch several actions into one task.\n"
@@ -599,19 +629,23 @@ def _builtin_update_tasks_factory(agent_context: dict):
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "add", "done", "in_progress", "replace", "remove"],
+                        "enum": ["set", "add", "done", "in_progress", "replace", "update", "remove"],
                         "description": (
                             "'set': replace the entire task list (provide a structured 'tasks' array). "
                             "'add': add one atomic task. "
                             "'done': mark a task complete. 'in_progress': make the "
                             "selected task the sole active task; this returns every "
                             "other active task to pending. 'replace': update task text "
-                            "while preserving its ID and status. 'remove': delete a task."
+                            "while preserving its ID and status. 'update': change only "
+                            "specific tasks (e.g. when the user revises part of the plan) "
+                            "by passing 'tasks' items with 'id' plus new 'text' and/or "
+                            "'status'; unlisted tasks are left untouched. "
+                            "'remove': delete a task."
                         )
                     },
                     "task_id": {
                         "type": "integer",
-                        "description": "Task ID for done/in_progress/remove actions."
+                        "description": "Task ID for done/in_progress/replace/remove actions."
                     },
                     "text": {
                         "type": "string",
@@ -635,12 +669,12 @@ def _builtin_update_tasks_factory(agent_context: dict):
                                     "enum": ["pending", "in_progress", "done"]
                                 }
                             },
-                            "required": ["text"],
                             "additionalProperties": False,
-                            "description": "Structured task item; exactly one concrete, independently completable action or outcome. ID and status preserve existing task state when provided."
+                            "description": "Structured task item; exactly one concrete, independently completable action or outcome. ID and status preserve existing task state when provided. 'text' is required for 'set'; for 'update', 'id' is required with 'text' and/or 'status'."
                         },
                         "description": (
-                            "Atomic task descriptions for the 'set' action. "
+                            "Atomic task descriptions for the 'set' action, or the "
+                            "per-ID changes for the 'update' action. "
                             "Split multi-action work across separate array entries."
                         )
                     }
@@ -713,20 +747,6 @@ def _builtin_save_plan_factory(agent_context: dict):
         if ms is None:
             return {"error": "Agent state is not enabled for this agent."}
 
-        # ATG enforcement: flagged agents on complex tasks must compile a task
-        # graph first — small models ignore the prompt instruction alone.
-        # save_plan unlocks once a compile was attempted (any atg status,
-        # including 'failed') or for trivial-classified tasks.
-        if (agent_context.get('enable_atg')
-                and not getattr(ms, 'auto_trivial', False)
-                and not getattr(ms, 'atg', None)):
-            return {"error": (
-                "This agent plans with Atomic Task Graph. Call "
-                "compile_task_graph(goal, context) with the task goal instead "
-                "of save_plan — the compiled graph becomes your plan file. "
-                "save_plan is only available if graph compilation fails."
-            )}
-
         filename = arguments.get('filename', '').strip()
         content = arguments.get('content', '')
 
@@ -750,131 +770,6 @@ def _builtin_save_plan_factory(agent_context: dict):
         return {
             "result": "Plan saved. Make sure to present this plan to user first.",
             "plan_file": relative_path
-        }
-
-    return tool_def, executor
-
-
-def _builtin_compile_task_graph_factory(agent_context: dict):
-    """Factory for the built-in 'compile_task_graph' tool (ATG).
-
-    Compiles a complex task into a DAG of atomic tool-use nodes via recursive
-    LLM decomposition (arXiv 2607.01942), stores it in agent_state.atg, and
-    writes a markdown rendering as the linked plan file — so the existing
-    save_plan/set_mode approval flow works unchanged. Exposed only when
-    agent_context['enable_atg'] (gated in get_builtin_tools).
-    """
-    import os
-    import re as _re
-
-    agent_id = agent_context.get('id', '')
-    _base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    plan_dir = os.path.join(_base_dir, 'agents', agent_id, 'plan')
-
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "compile_task_graph",
-            "description": (
-                "Compile a complex multi-step task into an executable task graph "
-                "(DAG of atomic tool-use steps with explicit dependencies). "
-                "Prefer this over a free-form save_plan for complex tasks: after "
-                "exploring, call compile_task_graph with the task goal. The graph "
-                "is saved as your plan file — present it to the user and wait for "
-                "approval before set_mode('execute'). Independent steps will run "
-                "in parallel and failures are repaired locally during execution."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal": {
-                        "type": "string",
-                        "description": "The full task goal to compile, in one or two sentences."
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": (
-                            "Optional findings from your exploration that the compiler "
-                            "should know (relevant file paths, constraints, decisions)."
-                        )
-                    }
-                },
-                "required": ["goal"]
-            }
-        }
-    }
-
-    def executor(arguments: dict) -> dict:
-        if not agent_context.get('enable_atg'):
-            return {"error": "ATG is not enabled for this agent."}
-        ms = agent_context.get('agent_state')
-        if ms is None:
-            return {"error": "Agent state is not enabled for this agent."}
-        runtime = agent_context.get('_atg_runtime')
-        if not runtime:
-            return {"error": "ATG runtime is not available in this context."}
-
-        goal = (arguments.get('goal') or '').strip()
-        if not goal:
-            return {"error": "'goal' must be a non-empty string."}
-
-        from backend.agent_runtime.atg.compiler import (
-            CompilationError, compile_task_graph, render_markdown)
-        try:
-            dag, history = compile_task_graph(
-                goal,
-                runtime.get('tools') or [],
-                runtime['llm'],
-                runtime['llm_lock'],
-                log_file=runtime.get('llm_log_path'),
-                context_excerpt=(arguments.get('context') or '')[:4000],
-            )
-        except CompilationError as e:
-            # Mark the attempt so save_plan's ATG redirect unlocks as fallback.
-            # root_goal kept for the re-arm continuation check.
-            ms.atg = {"status": "failed", "error": str(e)[:500], "root_goal": goal}
-            return {"error": f"Task graph compilation failed: {e}. "
-                             "You can retry with a clearer goal, or fall back to save_plan."}
-
-        waves = dag.waves()
-        ms.atg = {
-            "status": "compiled",
-            "dag": dag.to_dict(),
-            "history": history.to_dict(),
-            "repair_attempts": 0,
-            "stats": {"nodes_total": len(dag.nodes), "waves": len(waves)},
-        }
-
-        try:
-            from backend.event_stream import event_stream
-            event_stream.emit('atg_compiled', {
-                'agent_id': agent_id,
-                'session_id': agent_context.get('session_id'),
-                'nodes': len(dag.nodes), 'waves': len(waves),
-                'refinements': max(0, len(history.entries) - 1),
-            })
-        except Exception:
-            pass
-
-        slug = _re.sub(r'[^a-z0-9]+', '-', goal.lower()).strip('-')[:40] or 'task'
-        filename = f"atg-{slug}.md"
-        os.makedirs(plan_dir, exist_ok=True)
-        try:
-            with open(os.path.join(plan_dir, filename), 'w', encoding='utf-8') as f:
-                f.write(render_markdown(dag, history))
-        except Exception as e:
-            return {"error": f"Failed to write plan file: {e}"}
-        ms.set_plan_file(f"plan/{filename}")
-
-        return {
-            "result": (
-                f"Task graph compiled: {len(dag.nodes)} nodes in {len(waves)} waves. "
-                "Saved as your plan file — present the plan to the user and wait "
-                "for approval before set_mode('execute')."
-            ),
-            "plan_file": f"plan/{filename}",
-            "nodes": len(dag.nodes),
-            "waves": len(waves),
         }
 
     return tool_def, executor
@@ -1021,11 +916,7 @@ def _builtin_new_path_factory(agent_context: dict):
         from backend.agent_runtime.cmp import store as cmp_store
         if ms.cmp is None or not ms.cmp.get("paths"):
             # Adopt the ongoing work as P1 before branching off it.
-            prev_title = None
-            if isinstance(ms.atg, dict):
-                prev_title = ((ms.atg.get('dag') or {}).get('root_goal')
-                              or ms.atg.get('root_goal'))
-            prev_title = (prev_title or ms.plan_file or "Earlier conversation")
+            prev_title = ms.plan_file or "Earlier conversation"
             ms.cmp = cmp_store.new_cmp(ms, title=str(prev_title)[:60])
             _cmp_emit(agent_context, 'cmp_path_created',
                       {'path_id': 'P1', 'title': str(prev_title)[:60],
@@ -1152,7 +1043,10 @@ def _builtin_remember_factory(agent_context: dict):
             "name": "remember",
             "description": (
                 "Store a fact in long-term memory. "
-                "The summarizer persists it and builds the knowledge graph automatically."
+                "Provide `key` for facts with a stable identity (a preference, a "
+                "decision, a setting) — remembering the same key again REPLACES "
+                "the old value instead of piling up. Reuse an existing key from "
+                "'Known memory keys' when one fits."
             ),
             "parameters": {
                 "type": "object",
@@ -1161,11 +1055,21 @@ def _builtin_remember_factory(agent_context: dict):
                         "type": "string",
                         "description": "The fact to remember as a single clear sentence."
                     },
+                    "key": {
+                        "type": "string",
+                        "description": (
+                            "Stable dot-path identity for this fact, e.g. "
+                            "'user.deploy_target', 'preference.language', "
+                            "'decision.database'. Same key = the new fact "
+                            "supersedes the old one. Omit for one-off episodic "
+                            "facts with no natural key."
+                        )
+                    },
                     "category": {
                         "type": "string",
                         "enum": ["user_info", "preference", "decision",
                                  "context", "instruction", "general"],
-                        "description": "Category for this memory (default: general)."
+                        "description": "Category for this memory (default: general; ignored when `key` is given — derived from the key's first segment)."
                     }
                 },
                 "required": ["content"]
@@ -1179,7 +1083,8 @@ def _builtin_remember_factory(agent_context: dict):
         session_id = agent_context.get('session_id', '')
         return store_memory(agent_id, session_id,
                             args.get('content', ''),
-                            args.get('category', 'general'))
+                            args.get('category', 'general'),
+                            key=args.get('key'))
 
     return tool_def, executor
 
@@ -1187,8 +1092,10 @@ def _builtin_remember_factory(agent_context: dict):
 def _builtin_recall_factory(agent_context: dict):
     """Factory for the built-in 'recall' tool — searches long-term memory.
 
-    One tool, four modes:
+    One tool, five modes:
       - fts   (default): fast keyword search over remembered facts
+      - key             : exact-key point lookup of the current value of a keyed
+                          fact ('query' is the key, e.g. 'user.deploy_target')
       - think           : reason over everything known about a topic (synthesis
                           with citations + knowledge gaps)
       - graph           : traverse the entity knowledge graph from an entity
@@ -1211,12 +1118,12 @@ def _builtin_recall_factory(agent_context: dict):
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keywords to search for; the entity name when mode='graph'; or the KB filename (e.g. 'evonic.md') when mode='links'."
+                        "description": "Keywords to search for; the memory key (e.g. 'user.deploy_target') when mode='key'; the entity name when mode='graph'; or the KB filename (e.g. 'evonic.md') when mode='links'."
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["fts", "think", "graph", "links"],
-                        "description": "Retrieval mode (default: fts)."
+                        "enum": ["fts", "key", "think", "graph", "links"],
+                        "description": "Retrieval mode (default: fts). Use 'key' for the current value of a known memory key — fastest and most precise."
                     },
                     "edge_type": {
                         "type": "string",
@@ -1235,7 +1142,7 @@ def _builtin_recall_factory(agent_context: dict):
 
     def executor(args: dict) -> dict:
         from backend.agent_runtime.memory_manager import (
-            search_memories, synthesize_memory, graph_lookup,
+            search_memories, synthesize_memory, graph_lookup, recall_by_key,
         )
         agent_id = agent_context.get('id', '')
         query = args.get('query', '')
@@ -1267,6 +1174,8 @@ def _builtin_recall_factory(agent_context: dict):
                 pass
             return result
 
+        if mode == 'key':
+            return _augment(recall_by_key(agent_id, query))
         if mode == 'think':
             return _augment(synthesize_memory(agent_id, query))
         if mode == 'graph':
@@ -1517,3 +1426,85 @@ def _builtin_reset_active_model_factory(agent_context: dict):
             return {"error": f"Failed to reset active model: {str(e)}"}
 
     return tool_def, executor
+
+
+def _builtin_switch_workplace_factory(agent_context: dict):
+    """Factory for the opt-in 'switch_workplace' tool.
+
+    Exposed only when the agent has workplace_switch_enabled. Switching is
+    agent-wide (same as the chat header switcher) and takes effect for the
+    remaining tool calls of the current turn.
+    """
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "switch_workplace",
+            "description": (
+                "Move yourself to another workplace (machine or environment where your "
+                "bash/file tools run). action='list' shows the workplaces you may use and "
+                "which one is current; action='switch' moves you to `workplace` (id or exact "
+                "name; 'local' for the local workspace). The switch is persistent and applies "
+                "to all your sessions, so switch only when the task needs that machine."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "switch"]},
+                    "workplace": {"type": "string",
+                                  "description": "Workplace id or exact name (action='switch')."},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+    def executor(arguments: dict) -> dict:
+        from models.db import db
+        from backend.workplaces import agent_switch
+
+        agent_id = agent_context.get('id', '')
+        agent = db.get_agent(agent_id) if agent_id else None
+        if not agent or not agent.get('workplace_switch_enabled'):
+            return {"error": "Workplace switching is not enabled for this agent."}
+        action = (arguments or {}).get('action')
+        if action == 'list':
+            return {"workplaces": agent_switch.list_options(agent)}
+        if action != 'switch':
+            return {"error": "action must be 'list' or 'switch'."}
+        target = (arguments or {}).get('workplace')
+        if not target:
+            return {"error": "workplace is required for action='switch'."}
+        result = agent_switch.switch(agent_id, str(target), note=False)
+        if not result.get('ok'):
+            return {"error": result.get('error')}
+        if result.get('changed'):
+            # Make the rest of this turn's tool calls run on the new workplace.
+            fresh = db.get_agent(agent_id) or {}
+            agent_context['workplace_id'] = fresh.get('workplace_id')
+            agent_context['workspace'] = _workspace_for(fresh)
+        out = {"result": result['message'], "workplace": result['workplace']}
+        if result.get('transition'):
+            # The chat UI splits the turn at this point and draws the "Workplace switched" divider.
+            out["workplace_switch"] = result['transition']
+        return out
+
+    return tool_def, executor
+
+
+def _workspace_for(agent: dict):
+    """Workspace dir for an agent row, mirroring runtime's per-turn resolution."""
+    import json
+    from models.db import db
+    wp_id = agent.get('workplace_id') or None
+    if wp_id:
+        wp = db.get_workplace(wp_id)
+        if wp:
+            try:
+                cfg = json.loads(wp.get('config') or '{}')
+            except (TypeError, ValueError):
+                cfg = {}
+            path = cfg.get('workspace_path') or None
+            if wp.get('type') == 'tunnel':
+                return path
+            return path or agent.get('workspace') or None
+    return agent.get('workspace') or None

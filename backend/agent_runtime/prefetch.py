@@ -84,21 +84,23 @@ class TurnPrefetcher:
             from models.db import db
             from models.chatlog import chatlog_manager
             from backend.agent_runtime import context as _ctx
+            from backend.agent_runtime import simulation_spec as sim_spec
             from backend.channels.registry import channel_manager
 
             # Rebuild system prompt (may have changed since last turn)
             fresh_system_prompt = _ctx.build_system_prompt(agent)
 
             # Rebuild tools
-            fresh_tools = _ctx.build_tools(agent)
+            fresh_tools = _ctx.build_tools(agent, channel_id=ctx.channel_id)
 
             # Rebuild agent context. Explorers use their own configured tool
-            # set; everyone else inherits from the DB.
+            # set; everyone else resolves through sim_spec so this allowlist
+            # matches what build_tools() exposed to the model.
             if agent.get('is_explorer'):
                 from backend.agent_runtime import explorer as _explorer
                 assigned_tool_ids = list(_explorer.tool_ids(agent))
             else:
-                assigned_tool_ids = db.get_agent_tools(db_agent_id)
+                assigned_tool_ids = list(sim_spec.tools(agent, db_agent_id))
 
             # Inter-agent communication is enabled by the agent-level toggle;
             # send_agent_message is therefore available without a separate tool
@@ -148,6 +150,10 @@ class TurnPrefetcher:
             if agent.get('vision_enabled', 1) and 'describe_image' not in assigned_tool_ids:
                 assigned_tool_ids.append('describe_image')
 
+            # ask_user_question is on unless the agent turned it off.
+            if agent.get('ask_user_enabled', 1) and 'ask_user_question' not in assigned_tool_ids:
+                assigned_tool_ids.append('ask_user_question')
+
             # Agents with audio_enabled automatically get transcribe_audio.
             if agent.get('audio_enabled') and 'transcribe_audio' not in assigned_tool_ids:
                 assigned_tool_ids.append('transcribe_audio')
@@ -156,6 +162,9 @@ class TurnPrefetcher:
             # build_message_entry so the hint is only injected when available.
             has_describe_image = 'describe_image' in assigned_tool_ids
 
+            from backend.channels.whatsapp_identity import resolve_identity
+            _identity = resolve_identity(ctx.channel_id, ctx.external_user_id)
+
             fresh_agent_context = {
                 'id': agent_id,
                 '_db_agent_id': agent.get('_db_agent_id', agent_id),
@@ -163,11 +172,15 @@ class TurnPrefetcher:
                 'agent_name': agent.get('name', ''),
                 'agent_model': None,
                 'user_id': ctx.external_user_id,
+                'user_phone': _identity['user_phone'],
+                'user_jid': _identity['user_jid'],
+                'user_id_namespace': _identity['user_id_namespace'],
                 'channel_id': ctx.channel_id,
                 'session_id': session_id,
                 'assigned_tool_ids': assigned_tool_ids,
                 'workspace': agent.get('workspace') or None,
                 'workplace_id': agent.get('workplace_id') or None,
+                'send_file_allowed_path_regex': agent.get('send_file_allowed_path_regex', ''),
                 'is_super': bool(agent.get('is_super')),
                 'is_subagent': bool(agent.get('is_subagent')),
                 'is_explorer': bool(agent.get('is_explorer')),
@@ -186,8 +199,8 @@ class TurnPrefetcher:
                 'audio_enabled': agent.get('audio_enabled', 0),
                 'messaging_acl': agent.get('messaging_acl'),
                 'messaging_acl_mode': agent.get('messaging_acl_mode', 'whitelist'),
-                'enable_atg': bool(agent.get('enable_atg')) and bool(agent.get('enable_agent_state')),
                 'enable_cmp': bool(agent.get('enable_cmp')) and bool(agent.get('enable_agent_state')),
+                'workplace_switch_enabled': bool(agent.get('workplace_switch_enabled')),
             }
 
             # Re-load messages from JSONL (most expensive I/O, ~10-200ms)
@@ -304,14 +317,13 @@ class TurnPrefetcher:
                     if chan_instr:
                         fresh_messages.insert(1, {"role": "system", "content": chan_instr})
 
-            # Inject channel user identity (authoritative name for this session).
-            # Skip if already present in the message list (from JSONL history) to
-            # avoid duplicates when rebuilding from scratch.
+            # Inject trusted channel sender identity.  Skip if already present in
+            # the message list (from JSONL history) to avoid duplicate blocks.
             _already_injected = any(
                 "## Current User" in (m.get("content") or "")
                 for m in fresh_messages[:6]
             )
-            if ctx.channel_id and not ctx.external_user_id.startswith("__agent__") and not _already_injected:
+            if not _already_injected:
                 user_id_ctx = _ctx.build_user_identity_context(
                     ctx.channel_id, ctx.external_user_id,
                 )

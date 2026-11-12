@@ -4,6 +4,7 @@ Commands are parsed and executed in the backend so they work on all channels
 (Telegram, web, etc.) without any frontend-specific logic.
 """
 
+import json
 import logging
 import re
 import os
@@ -41,18 +42,47 @@ class SlashCommandRegistry:
 
     def __init__(self):
         self._commands: Dict[str, SlashCommand] = {}
+        self._providers: Dict[str, Callable[[str], list]] = {}
 
     def register(self, name: str, handler: CommandHandler, description: str = "", parameters: list = None):
         """Register a command handler."""
         self._commands[name] = SlashCommand(name, handler, description, parameters)
 
+    def register_provider(self, key: str, provider: Callable[[str], list]):
+        """Register a per-agent command provider.
+
+        `provider(agent_id)` returns a list of SlashCommand objects that exist only
+        for that agent (e.g. panel actions with an assigned slash command).
+        Statically registered commands always win on a name clash.
+        """
+        self._providers[key] = provider
+
     def get(self, name: str) -> Optional[SlashCommand]:
-        """Get a command by name."""
+        """Get a statically registered command by name."""
         return self._commands.get(name)
 
     def list_commands(self) -> list:
-        """Return list of SlashCommand objects."""
+        """Return list of statically registered SlashCommand objects."""
         return list(self._commands.values())
+
+    def provided_commands(self, agent_id: str) -> list:
+        """Return provider commands for an agent, minus any static name clash."""
+        out = []
+        for key, provider in list(self._providers.items()):
+            try:
+                for cmd in provider(agent_id) or []:
+                    if cmd.name not in self._commands:
+                        out.append(cmd)
+            except Exception:
+                _logger.warning("Slash command provider %r failed for agent %s", key, agent_id, exc_info=True)
+        return out
+
+    def resolve(self, name: str, agent_id: str) -> Optional[SlashCommand]:
+        """Get a command by name for an agent — static first, then providers."""
+        cmd = self._commands.get(name)
+        if cmd:
+            return cmd
+        return next((c for c in self.provided_commands(agent_id) if c.name == name), None)
 
 
 def _expand_slash_list(raw_value: str, all_names: set) -> set:
@@ -66,6 +96,36 @@ def _expand_slash_list(raw_value: str, all_names: set) -> set:
         allowed = {c.strip() for c in raw[1:].split(',') if c.strip()}
         return set(all_names) - allowed
     return {c.strip() for c in raw.split(',') if c.strip()}
+
+
+class _CommandSuppressed:
+    """Sentinel: a slash command was recognized but suppressed by a per-agent setting.
+
+    This is distinct from `None` (unknown command), which tells callers to fall
+    through to normal LLM chat processing. When a command is suppressed, callers
+    must not reply and must not forward the message to the LLM.
+    """
+    __slots__ = ()
+
+    def __repr__(self):  # pragma: no cover
+        return "<COMMAND_SUPPRESSED>"
+
+
+# Returned by execute_command() when a command is deliberately ignored
+# (currently: `/help` when the agent's `help_enabled` setting is off).
+COMMAND_SUPPRESSED = _CommandSuppressed()
+
+
+def _help_command_enabled(agent_id: str) -> bool:
+    """Return whether the agent should respond to the `/help` command (default True)."""
+    try:
+        from models.db import db
+        agent = db.get_agent(agent_id)
+        if agent is None:
+            return True
+        return bool(agent.get('help_enabled', True))
+    except Exception:
+        return True
 
 
 def _persist_session_agent_state(chat_db, session_id: str, ms) -> None:
@@ -87,7 +147,6 @@ def _persist_session_agent_state(chat_db, session_id: str, ms) -> None:
         'plan_file': data.get('plan_file'),
         'states': data.get('states', {}),
         'auto_trivial': data.get('auto_trivial', False),
-        'atg': data.get('atg'),
         'cmp': data.get('cmp'),
     })
     chat_db.upsert_session_state(session_id, json.dumps(session_data))
@@ -95,7 +154,7 @@ def _persist_session_agent_state(chat_db, session_id: str, ms) -> None:
 
 def list_available_commands(agent_id: str, channel_id: Optional[str] = None) -> list:
     """Return registered commands available to an agent on the given channel."""
-    commands = command_registry.list_commands()
+    commands = command_registry.list_commands() + command_registry.provided_commands(agent_id)
     try:
         from models.db import db
         super_agent = db.get_super_agent()
@@ -106,9 +165,11 @@ def list_available_commands(agent_id: str, channel_id: Optional[str] = None) -> 
         can_cd = is_super or bool(workplace and workplace.get('type') in ('remote', 'tunnel'))
         has_subagent = is_super or 'subagent' in db.get_agent_skills(agent_id)
         disabled_raw = (agent.get('disabled_slash_commands') or '') if agent else ''
+        help_enabled = bool(agent.get('help_enabled', True)) if agent else True
     except Exception:
         is_super = can_cd = has_subagent = False
         disabled_raw = ''
+        help_enabled = True
 
     disabled_set = _expand_slash_list(disabled_raw, {cmd.name for cmd in commands})
 
@@ -121,6 +182,8 @@ def list_available_commands(agent_id: str, channel_id: Optional[str] = None) -> 
         if cmd.name == 'sub' and not has_subagent:
             continue
         if not is_super and cmd.name in disabled_set:
+            continue
+        if cmd.name == 'help' and not help_enabled:
             continue
         available.append(cmd)
     return sorted(available, key=lambda c: c.name)
@@ -174,9 +237,15 @@ def execute_command(
     """Execute a slash command and return the response text.
 
     Returns the command response string, or None if the command is not found
-    (caller should then treat the message as normal chat).
+    (caller should then treat the message as normal chat). Returns
+    COMMAND_SUPPRESSED when the command is recognized but disabled for this
+    agent (e.g. `/help` with `help_enabled` off) — callers must then ignore
+    the message entirely: no reply, no LLM fallthrough.
     """
-    cmd = command_registry.get(cmd_name)
+    if cmd_name == 'help' and not _help_command_enabled(agent_id):
+        return COMMAND_SUPPRESSED
+
+    cmd = command_registry.resolve(cmd_name, agent_id)
     if not cmd:
         return None  # Unknown command — fall through to normal LLM processing
 
@@ -206,7 +275,6 @@ def _register_builtins():
         no_archive = not archive_requested
 
         db.clear_session(session_id, agent_id, no_archive=no_archive)
-
         # Clear in-memory loaded skill state so skill badges disappear from session state UI
         from backend.agent_runtime import agent_runtime
         agent_runtime._session_skill_mds.pop(session_id, None)
@@ -224,8 +292,7 @@ def _register_builtins():
             'plan_file': fresh.plan_file,
             'states': fresh.states,
             'auto_trivial': fresh.auto_trivial,
-            'atg': None,   # full-replace already wipes these; explicit for clarity
-            'cmp': None,
+            'cmp': None,   # full-replace already wipes this; explicit for clarity
         }
         db.upsert_session_state(session_id, json.dumps(session_data), agent_id=agent_id)
         # Global: reset focus only
@@ -248,7 +315,9 @@ def _register_builtins():
         # Emit session_clear event
         try:
             from backend.event_stream import event_stream
-            event_stream.emit('session_clear', {'session_id': session_id, 'agent_id': agent_id})
+            event_stream.emit('session_clear', {
+                'session_id': session_id, 'agent_id': agent_id, 'turn_id': None,
+            })
         except Exception:
             pass
 
@@ -688,14 +757,25 @@ def _register_builtins():
         from backend.agent_state import AgentState
         from models.chat import agent_chat_manager
 
-        # Create a fresh AgentState in plan mode
-        ms = AgentState()
-
         _db = agent_chat_manager.get(agent_id)
+        session_content = _db.get_session_state(session_id)
+        # Preserve CMP, plan, tasks, and extension-owned session fields.
+        # Only the operating mode changes for this command.
+        ms = AgentState.deserialize(session_content) if session_content else AgentState()
+        ms.set_mode("plan", reason="slash command /plan")
         _persist_session_agent_state(_db, session_id, ms)
 
-        # Reset focus in global agent_state (focus is cross-session).
-        _db.upsert_agent_state(ms.serialize())
+        # Focus is global, but do not replace unrelated global state such as
+        # an active fallback-model marker.
+        raw_global = _db.get_agent_state()
+        try:
+            global_data = json.loads(raw_global) if raw_global else {}
+        except (TypeError, ValueError):
+            global_data = {}
+        if not isinstance(global_data, dict):
+            global_data = {}
+        global_data.update({'focus': False, 'focus_reason': None})
+        _db.upsert_agent_state(json.dumps(global_data))
 
         return "Switched to plan mode."
 
@@ -753,6 +833,75 @@ def _register_builtins():
         "Switch to execute mode",
     )
 
+    # /goal <query> — persist a durable goal and start an agent-visible system turn.
+    # The runtime records a translated system event rather than forwarding the
+    # slash-command literal into the model's conversation history.
+    def goal_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> Optional[str]:
+        from models.db import db
+        from backend.agent_state import AgentState
+        from models.chat import agent_chat_manager
+
+        goal = args.strip()
+        if not goal:
+            return "Usage: /goal <what the agent should complete>"
+
+        agent = db.get_agent(agent_id)
+        if not agent:
+            return "Error: Agent not found."
+        if not agent.get("enable_agent_state"):
+            return "Agent state is not enabled for this agent."
+
+        chat_db = agent_chat_manager.get(agent_id)
+        session_content = chat_db.get_session_state(session_id)
+        ms = AgentState.deserialize(session_content) if session_content else AgentState()
+        result = ms.set_mode(
+            "execute",
+            reason="slash command /goal",
+            bypass_plan_requirement=True,
+        )
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        raw = chat_db.get_session_state(session_id)
+        try:
+            session_data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+        from backend.active_goal import create_active_goal, render_active_goal_event
+
+        state_data = json.loads(ms.serialize())
+        active_goal = create_active_goal(goal)
+        session_data.update({
+            'mode': state_data.get('mode', 'plan'),
+            'tasks': state_data.get('tasks', []),
+            'next_task_id': state_data.get('next_task_id', 1),
+            'plan_file': state_data.get('plan_file'),
+            'states': state_data.get('states', {}),
+            'auto_trivial': state_data.get('auto_trivial', False),
+            'cmp': state_data.get('cmp'),
+            'active_goal': active_goal,
+        })
+        chat_db.upsert_session_state(session_id, json.dumps(session_data))
+        # The runtime turns this into an agent-visible [SYSTEM] goal event and
+        # drives the turn with it, keeping the slash-command literal out of the
+        # LLM transcript.
+        return render_active_goal_event(active_goal)
+
+    command_registry.register(
+        "goal",
+        goal_handler,
+        "Execute a goal until it is complete, blocked, or reaches its nudge limit",
+        parameters=[{"name": "query", "placeholder": "Describe the goal to complete"}],
+    )
+
     def unfocus_handler(
         session_id: str,
         agent_id: str,
@@ -790,6 +939,8 @@ def _register_builtins():
         channel_id: Optional[str],
         args: str,
     ) -> str:
+        import json
+
         from models.db import db
         from backend.agent_state import AgentState
         from models.chat import agent_chat_manager
@@ -829,6 +980,25 @@ def _register_builtins():
         # Agent state: per-session (mode/plan_file) from session_state, global (focus) from agent_state
         _db = agent_chat_manager.get(agent_id)
         session_content = _db.get_session_state(session_id)
+        try:
+            session_data = json.loads(session_content) if session_content else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+        try:
+            resolved_model = db.resolve_model_config(model) if model else {}
+        except Exception:
+            resolved_model = model or {}
+        from backend.provider.codex_client import model_supports_fast_mode
+        fast_available = (
+            resolved_model.get("api_format") == "codex"
+            and model_supports_fast_mode(resolved_model.get("model_name"))
+        )
+        lines.append(
+            f"Fast: {'on' if session_data.get('service_tier') == 'priority' else 'off'}"
+            if fast_available else "Fast: unavailable"
+        )
         if session_content:
             sess_ms = AgentState.deserialize(session_content)
             lines.append(f"Mode: {sess_ms.mode}")
@@ -1121,6 +1291,58 @@ def _register_builtins():
         parameters=[{"name": "action", "options": ["current", "list", "set"]}, {"name": "model"}],
     )
 
+    # /fast — Session-scoped Codex Priority Processing toggle
+    def fast_handler(
+        session_id: str,
+        agent_id: str,
+        external_user_id: str,
+        channel_id: Optional[str],
+        args: str,
+    ) -> str:
+        import json
+
+        from backend.provider.codex_client import model_supports_fast_mode
+        from models.chat import agent_chat_manager
+        from models.db import db
+
+        model = db.get_agent_model(agent_id)
+        model = db.resolve_model_config(model) if model else {}
+        if (model.get("api_format") != "codex"
+                or not model_supports_fast_mode(model.get("model_name"))):
+            return "Fast mode is not supported by the current model."
+
+        chat_db = agent_chat_manager.get(agent_id)
+        raw = chat_db.get_session_state(session_id)
+        try:
+            session_data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            session_data = {}
+        if not isinstance(session_data, dict):
+            session_data = {}
+
+        action = args.strip().lower()
+        if action in ("", "status"):
+            mode = "on" if session_data.get("service_tier") == "priority" else "off"
+            return f"Fast mode: {mode}."
+        if action in ("on", "fast"):
+            session_data["service_tier"] = "priority"
+            reply = "Fast mode enabled for this session (higher credit usage)."
+        elif action in ("off", "normal"):
+            session_data.pop("service_tier", None)
+            reply = "Fast mode disabled for this session."
+        else:
+            return "Usage: /fast [on|off|status]"
+
+        chat_db.upsert_session_state(session_id, json.dumps(session_data))
+        return reply
+
+    command_registry.register(
+        "fast",
+        fast_handler,
+        "Show or set Codex Fast mode for this session — /fast [on|off|status]",
+        parameters=[{"name": "mode", "options": ["on", "off", "status", "fast", "normal"]}],
+    )
+
 
 
     # /sub — Spawn a sub-agent with a direct task (requires subagent skill)
@@ -1206,52 +1428,52 @@ def _register_builtins():
         args: str,
     ) -> str:
         from backend.agent_runtime import agent_runtime
-        from backend.agent_runtime.background_jobs import (
-            background_jobs, create_detach_schedule)
+        from backend.agent_runtime import monitors
+        from backend.agent_runtime.background_jobs import background_jobs
 
-        jobs = background_jobs.active_for_session(session_id)
+        jobs = background_jobs.running_for_session(session_id)
         if not jobs:
-            # Background processes are auto-watched at spawn now, so there is
-            # usually nothing left to detach — report what is being monitored.
-            watched = [j for j in background_jobs.list_for_session(session_id)
-                       if j.detached and j.status == 'running']
-            if watched:
-                names = ", ".join(f"`{j.command}`" for j in watched)
-                return (
-                    f"Already monitored automatically: {names}.\n"
-                    "You'll be notified when they finish. Check anytime with /jobs."
-                )
             return (
-                "No background process found for this session. Background "
-                "processes (tmux/screen/nohup) are monitored automatically "
-                "when started — check with /jobs."
+                "No running background process found for this session. "
+                "Check with /jobs."
             )
+
+        already = monitors.monitored_job_ids(agent_id, session_id)
+        pending = [j for j in jobs if j.job_id not in already]
+        if not pending:
+            names = ", ".join(f"`{j.command}`" for j in jobs)
+            return (f"Already monitored: {names}.\n"
+                    "I'll report back when they finish. See /jobs.")
 
         # End the current polling turn so the agent stops waiting and can chat.
         agent_runtime.request_stop(session_id)
 
-        detached = []
-        for job in jobs:
-            schedule_id = create_detach_schedule(
-                job, agent_id, external_user_id, channel_id)
-            if schedule_id:
-                background_jobs.mark_detached(job.job_id, schedule_id)
-                detached.append(job)
+        agent = {
+            'agent_id': agent_id, 'session_id': session_id,
+            'user_id': external_user_id, 'channel_id': channel_id,
+        }
+        attached, failed = [], []
+        for job in pending:
+            res = monitors.attach(agent, target={'job_id': job.job_id},
+                                  when={'on_exit': True},
+                                  note='attached via /detach')
+            (failed if res.get('error') else attached).append(job)
 
-        if not detached:
-            return "Failed to detach: could not create the background watcher."
+        if not attached:
+            return "Failed to detach: could not attach the monitor."
 
-        names = ", ".join(f"`{j.command}`" for j in detached)
-        return (
-            f"Detached {len(detached)} background job(s): {names}.\n"
-            "They keep running — I'll report back when they finish (even if the "
-            "server restarts). Check anytime with /jobs."
-        )
+        names = ", ".join(f"`{j.command}`" for j in attached)
+        msg = (f"Monitoring {len(attached)} background job(s): {names}.\n"
+               "They keep running — I'll report back when they finish (even if "
+               "the server restarts). Check anytime with /jobs.")
+        if failed:
+            msg += f"\nCould not monitor {len(failed)} job(s)."
+        return msg
 
     command_registry.register(
         "detach",
         detach_handler,
-        "Detach the running long-running process to the background",
+        "Stop waiting on the running long-running process and monitor it instead",
     )
 
     # /jobs — List background jobs tracked for this session
@@ -1263,42 +1485,52 @@ def _register_builtins():
         args: str,
     ) -> str:
         import time as _time
+        from backend.agent_runtime import monitors
         from backend.agent_runtime.background_jobs import (
-            background_jobs, SCHEDULE_OWNER_TYPE)
-        from backend.scheduler import scheduler
+            background_jobs, refresh_statuses)
+        from models.db import db
+
+        # Nothing polls these in the background, so refresh on demand — one
+        # round-trip for the whole session.
+        try:
+            agent = db.get_agent(agent_id) or {}
+            refresh_statuses(session_id, {**agent, 'agent_id': agent_id})
+        except Exception:
+            pass
+
+        by_job = {}
+        loose = []
+        for m in monitors.list_for_session(agent_id, session_id):
+            (by_job.setdefault(m['job_id'], []) if m.get('job_id')
+             else loose).append(m)
 
         lines = []
+        for j in background_jobs.list_for_session(session_id):
+            if j.status == 'running':
+                state = f"⏳ running, {int(_time.time() - j.started_at)}s"
+            else:
+                code = '' if j.exit_code is None else f" (exit {j.exit_code})"
+                state = f"✅ {j.status}{code}"
+            watchers = by_job.get(j.job_id) or []
+            watch = (" · 👁 " + "; ".join(m['condition'] for m in watchers)
+                     if watchers else " · unmonitored")
+            log = f" · log: {j.log_file}" if j.log_file else ""
+            lines.append(f"- `{j.job_id}` `{j.command}` — {state}{watch}{log}")
 
-        # Attached (not yet detached) jobs — live only in the in-memory registry.
-        for j in background_jobs.active_for_session(session_id):
-            elapsed = int(_time.time() - j.started_at)
-            lines.append(f"- `{j.command}` — ⏳ running (attached), {elapsed}s "
-                         f"· log: {j.log_file}")
-
-        # Detached jobs — persisted poll schedules for this session.
-        try:
-            schedules = scheduler.list_schedules(
-                owner_type=SCHEDULE_OWNER_TYPE, owner_id=agent_id)
-        except Exception:
-            schedules = []
-        for s in schedules:
-            cfg = s.get("action_config") or {}
-            if cfg.get("session_id") != session_id:
-                continue
-            cmd = cfg.get("command", "?")
-            log_file = cfg.get("log_file", "")
-            lines.append(f"- `{cmd}` — ⏳ running (detached, watched), "
-                         f"· log: {log_file}")
+        for m in loose:
+            lines.append(f"- `{m['monitor_id']}` watching `{m['watching']}` "
+                         f"— 👁 {m['condition']}")
 
         if not lines:
-            return ("No active background jobs for this session. "
-                    "(Finished jobs are reported in chat and then cleared.)")
+            return ("No background jobs or monitors for this session. "
+                    "Background processes run unwatched unless a monitor is "
+                    "attached to them.")
         return "**Background jobs:**\n" + "\n".join(lines)
 
     command_registry.register(
         "jobs",
         jobs_handler,
-        "List background jobs for this session",
+        "List background jobs for this session and their monitors",
     )
 
     # /kb-organize — Manually trigger KB organizer sub-agent for the current agent

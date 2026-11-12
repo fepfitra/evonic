@@ -364,11 +364,12 @@ class AgentChatDB:
             return rows
 
     def get_latest_agent_request_metadata(self, session_id: str, sender_agent_id: str = None) -> Optional[dict]:
-        """Return the newest routable agent-request metadata in a session.
+        """Return the newest reply-capable agent request in a session.
 
         Only user-role rows are candidates. Invalid JSON, non-agent messages,
-        sender mismatches, and requests without ``report_to_id`` are skipped so
-        later background notifications cannot shadow a routable delegation.
+        sender mismatches, and requests without either a human route or a
+        synchronous reply ID are skipped so background notifications cannot
+        shadow an active delegation.
         """
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
@@ -386,7 +387,7 @@ class AgentChatDB:
                     continue
                 if sender_agent_id and metadata.get('from_agent_id') != sender_agent_id:
                     continue
-                if metadata.get('report_to_id'):
+                if metadata.get('report_to_id') or metadata.get('reply_to_id'):
                     return metadata
         return None
 
@@ -1020,6 +1021,17 @@ class AgentChatDB:
             cursor.execute(
                 "SELECT id, content, category, source_session_id, created_at, updated_at, expired, dimension, superseded_by FROM memories WHERE dimension IS NULL AND expired = 0 AND superseded_by IS NULL ORDER BY updated_at DESC LIMIT 10000")
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_active_dimensions(self, limit: int = 50) -> List[str]:
+        """Distinct dimensions (keys) of active memories, most recently updated first."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT dimension, MAX(updated_at) AS mu FROM memories "
+                "WHERE dimension IS NOT NULL AND expired = 0 AND superseded_by IS NULL "
+                "GROUP BY dimension ORDER BY mu DESC LIMIT ?",
+                (limit,))
+            return [r[0] for r in cursor.fetchall()]
 
     def supersede_memory(self, old_memory_id: int, new_memory_id: int):
         """Mark old_memory_id as superseded by new_memory_id."""

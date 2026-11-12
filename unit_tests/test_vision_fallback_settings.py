@@ -149,6 +149,8 @@ def test_vision_resolver_orders_both_explicit_fallbacks_before_implicit_models()
     with patch.object(db, 'get_agent_model', return_value=db.get_model_by_id('agent_model')):
         models, error = _resolve_vision_models(agent)
     assert error is None
+    # Implicit vision models come from `get_enabled_llm_models()`, which never
+    # includes decision models such as the builtin `LiquidAI d1-3B`.
     assert [model['id'] for model in models] == [
         'primary', 'fallback_1', 'fallback_2', 'agent_model', 'automatic',
     ]

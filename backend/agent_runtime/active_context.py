@@ -8,7 +8,6 @@ Shadow mode measures the projection; enforced mode sends the validated projectio
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -34,13 +33,31 @@ _MUTATION_RECEIPT_TOOLS = frozenset({
 })
 _CONTEXT_CONTROL_TOOLS = frozenset({
     "use_skill", "unload_skill", "save_plan", "set_mode", "update_tasks",
-    "state", "compile_task_graph", "switch_path", "new_path", "reset_active_model",
+    "state", "switch_path", "new_path", "reset_active_model",
 })
 # Tools whose results must ALWAYS be retained verbatim in the LLM context.
 # use_skill/unload_skill results inform the LLM whether a skill is loaded/unloaded;
 # compacting them into receipts causes confusion (regression edaa229 + 2e09fc9).
 _PRESERVE_VERBATIM_TOOLS = frozenset({"use_skill", "unload_skill"})
 _ELIGIBLE_TOOLS = _INFORMATIONAL_TOOLS | _MUTATION_RECEIPT_TOOLS | _CONTEXT_CONTROL_TOOLS
+# The only argument keys a receipt may name, per tool. Without an identity the model
+# cannot tell which file a compacted read_file touched, so it calls the tool again;
+# with one it can skip the repeat. Every key here is checked against the tool's real
+# signature — an unlisted tool (including every plugin tool) emits no arguments at
+# all, which keeps the no-arbitrary-arguments rule these receipts were written for.
+_RECEIPT_IDENTITY_ARGS = {
+    "read_file": ("file_path",),
+    "write_file": ("file_path",),
+    "str_replace": ("file_path",),
+    "patch": ("file_path",),
+    "find": ("glob_pattern",),
+    "stats": ("path",),
+    "tree": ("path",),
+}
+# Sized so a receipt never grows past the format it replaced (~56 chars), even for the
+# longest tool name here. Paths are truncated from the left because the tail — the
+# filename — is what identifies them; the leading directories are shared boilerplate.
+_RECEIPT_ARG_MAX_CHARS = 28
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,18 @@ class ActiveContextProjection:
     completed_groups: int
     compacted_groups: int
     retained_groups: int
+    # Context-usage signal attribution (task #842).  ``provider_prompt_tokens``
+    # is the provider-reported prompt size of the previous request (0 when the
+    # provider gave no usage block); ``usage_signal`` is the effective signal
+    # compared against the threshold (the max of provider and local estimate,
+    # so an under-counting local estimator can no longer mask a full window);
+    # ``trigger_source`` names which signal crossed the threshold; and
+    # ``no_eligible_groups`` flags the case where the threshold was reached but
+    # nothing could be compacted (diagnostic, request still sent as-is).
+    provider_prompt_tokens: int = 0
+    usage_signal: int = 0
+    trigger_source: Optional[str] = None
+    no_eligible_groups: bool = False
 
     @property
     def saved_tokens(self) -> int:
@@ -75,6 +104,10 @@ class ActiveContextProjection:
             "completed_groups": self.completed_groups,
             "compacted_groups": self.compacted_groups,
             "retained_groups": self.retained_groups,
+            "provider_prompt_tokens": self.provider_prompt_tokens,
+            "usage_signal": self.usage_signal,
+            "trigger_source": self.trigger_source,
+            "no_eligible_groups": self.no_eligible_groups,
         }
 
 
@@ -91,6 +124,29 @@ def normalize_mode(mode: Any) -> str:
     """Return a supported mode, defaulting invalid input to safe ``off``."""
     value = str(mode or "off").strip().lower()
     return value if value in _VALID_MODES else "off"
+
+
+def resolve_soft_token_threshold(
+    fallback_tokens: Any,
+    context_window: Any = None,
+    capacity_percent: Any = 85,
+) -> int:
+    """Choose the active-context trigger from the selected model's capacity.
+
+    A model context window is an input capacity, so it is the appropriate basis
+    for deciding when to shrink the request before a provider rejects it.  The
+    established fixed threshold remains the safe fallback for models that do not
+    declare a usable context window.
+    """
+    try:
+        fallback = max(0, int(fallback_tokens))
+        window = int(context_window or 0)
+        percent = int(capacity_percent)
+    except (TypeError, ValueError):
+        return max(0, int(fallback_tokens or 0))
+    if window <= 0 or not 1 <= percent <= 100:
+        return fallback
+    return max(1, window * percent // 100)
 
 
 def validate_tool_pairs(
@@ -125,6 +181,80 @@ def validate_tool_pairs(
         if len(actual) != len(expected) and not allow_unresolved:
             raise ValueError("tool calls are unresolved")
         i = j
+
+
+def repair_tool_pairs(messages: List[Dict[str, Any]]) -> bool:
+    """Repair orphaned ``tool_calls`` / ``tool`` messages in-place.
+
+    Providers reject any history where an assistant message with ``tool_calls``
+    is not immediately followed by a ``tool`` response for every
+    ``tool_call_id``, or where a ``tool`` message has no declaring assistant.
+    This can slip through history reconstruction (SQLite-fallback path,
+    prefetch, or live edge cases). The repair is structural only:
+
+    1. Inject a synthetic error ``tool`` response for any declared
+       ``tool_call_id`` that has no matching response -- emitted in *declared*
+       call order so the result is deterministic (a set would make the repair
+       hash-seed dependent).
+    2. Drop ``tool`` messages whose ``tool_call_id`` was never declared
+       (orphaned) or is a duplicate response.
+
+    Idempotent -- a no-op on well-formed histories. Returns True if it changed
+    ``messages``, so callers can gate a retry on "something was actually
+    repaired".
+    """
+    repaired = False
+    out: List[Dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    declared_ids: set = set()
+    responded_ids: set = set()
+    while i < n:
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tc_ids = [tc.get("id") for tc in msg.get("tool_calls", []) if tc.get("id")]
+            declared_ids.update(tc_ids)
+            out.append(msg)
+            # Collect the contiguous run of tool responses that follow.
+            j = i + 1
+            seen_here: set = set()
+            while j < n and messages[j].get("role") == "tool":
+                _tcid = messages[j].get("tool_call_id", "")
+                if _tcid in tc_ids and _tcid not in seen_here and _tcid not in responded_ids:
+                    seen_here.add(_tcid)
+                    responded_ids.add(_tcid)
+                    out.append(messages[j])
+                else:
+                    # Orphaned or duplicate tool response -- drop it.
+                    repaired = True
+                j += 1
+            # Inject synthetic responses for any tool_call_id left unanswered.
+            for _mid in tc_ids:
+                if _mid not in seen_here:
+                    out.append({
+                        "role": "tool",
+                        "tool_call_id": _mid,
+                        "content": '{"error": "Tool execution was interrupted before completion."}',
+                    })
+                    responded_ids.add(_mid)
+                    repaired = True
+            i = j
+        elif msg.get("role") == "tool":
+            # A tool message not immediately preceded by its declaring assistant.
+            _tcid = msg.get("tool_call_id", "")
+            if _tcid in declared_ids and _tcid not in responded_ids:
+                responded_ids.add(_tcid)
+                out.append(msg)
+            else:
+                repaired = True  # orphaned or duplicate -- drop
+            i += 1
+        else:
+            out.append(msg)
+            i += 1
+
+    if repaired:
+        messages[:] = out
+    return repaired
 
 
 def _collect_groups(messages: Sequence[Dict[str, Any]]) -> List[_ToolGroup]:
@@ -176,20 +306,52 @@ def _eligible(group: _ToolGroup) -> bool:
     )
 
 
+def _identity_args(name: str, call: Dict[str, Any]) -> str:
+    """Return the allowlisted identity arguments for one call, or "" when none apply."""
+    allowed = _RECEIPT_IDENTITY_ARGS.get(name)
+    if not allowed:
+        return ""
+    raw = (call.get("function") or {}).get("arguments")
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    values = []
+    for key in allowed:
+        value = parsed.get(key)
+        # bool is an int subclass, and a boolean flag is never an identity.
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            continue
+        text = " ".join(str(value).split())
+        if len(text) > _RECEIPT_ARG_MAX_CHARS:
+            text = "…" + text[-(_RECEIPT_ARG_MAX_CHARS - 1):]
+        if text:
+            values.append(text)
+    return ", ".join(values)
+
+
 def _receipt_line(sequence: int, group: _ToolGroup) -> str:
-    """Build a sanitized receipt containing no arguments or raw tool output."""
-    labels = ", ".join(group.names)
-    kind = "informational"
+    """Build a sanitized receipt: tool names plus allowlisted identity arguments only.
+
+    Raw tool output and non-allowlisted arguments never reach this line.
+    """
+    calls = group.assistant.get("tool_calls") or ()
+    labels = []
+    for index, name in enumerate(group.names):
+        args = _identity_args(name, calls[index] if index < len(calls) else {})
+        labels.append(f"{name}({args})" if args else name)
+    kind = "info"
     if any(name in _CONTEXT_CONTROL_TOOLS for name in group.names):
-        kind = "context-control"
+        kind = "ctl"
     elif any(name in _MUTATION_RECEIPT_TOOLS for name in group.names):
-        kind = "mutation"
-    digest_input = "|".join(
-        str(result.get("tool_call_id") or "") + ":" + str(result.get("content") or "")
-        for result in group.results
-    )
-    digest = hashlib.sha256(digest_input.encode("utf-8", errors="replace")).hexdigest()[:12]
-    return f"- #{sequence} {labels} — success ({kind}); result-ref sha256:{digest}"
+        kind = "mut"
+    # These lines recur once per compacted group, so every character is paid again on
+    # each iteration of a long loop. The identity argument takes the place of the old
+    # result digest, which nothing read back — bounded by _RECEIPT_ARG_MAX_CHARS so the
+    # line never outgrows the format it replaced, and more groups fit the same budget.
+    return f"- #{sequence} {', '.join(labels)}: {kind}"
 
 
 def _bounded_ledger(entries: Sequence[str], max_chars: int) -> str:
@@ -225,13 +387,24 @@ def project_active_context(
     recent_completed_groups: int = 2,
     receipt_max_chars: int = 4000,
     soft_token_threshold: int = 12000,
+    provider_prompt_tokens: Optional[int] = None,
 ) -> ActiveContextProjection:
     """Build a deterministic bounded projection, failing open on every error.
 
     Only complete, successful, explicitly classified groups older than the recent
     frontier are eligible. The canonical sequence is never mutated.
+
+    The threshold is compared against the larger of the local token estimate and
+    the provider-reported prompt size of the previous request
+    (``provider_prompt_tokens``).  The provider number is the ground truth of
+    what the model actually counted, so it is the primary signal; the local
+    estimate remains the fallback when the provider gave no usage block.
     """
     normalized_mode = normalize_mode(mode)
+    try:
+        provider_tokens = max(0, int(provider_prompt_tokens or 0))
+    except (TypeError, ValueError):
+        provider_tokens = 0
     try:
         canonical_copy = copy.deepcopy(list(canonical_messages))
     except Exception as exc:
@@ -249,11 +422,25 @@ def project_active_context(
             completed_groups=0,
             compacted_groups=0,
             retained_groups=0,
+            provider_prompt_tokens=provider_tokens,
+            usage_signal=provider_tokens,
         )
     try:
         canonical_tokens = estimate_context_tokens(canonical_copy, list(tools or []))
     except Exception:
         canonical_tokens = 0
+    threshold = max(0, int(soft_token_threshold))
+    # Provider-reported usage is primary; the local estimate is the fallback.
+    # Comparing the max of both means an under-counting local estimator can no
+    # longer keep compaction from triggering on a nearly full window (#842).
+    usage_signal = max(canonical_tokens, provider_tokens)
+    triggered = normalized_mode != "off" and usage_signal >= threshold
+    trigger_source = None
+    if triggered:
+        provider_hit = provider_tokens >= threshold
+        local_hit = canonical_tokens >= threshold
+        trigger_source = ("both" if provider_hit and local_hit
+                          else "provider" if provider_hit else "local")
     base = dict(
         mode=normalized_mode,
         canonical_tokens=canonical_tokens,
@@ -261,8 +448,12 @@ def project_active_context(
         completed_groups=0,
         compacted_groups=0,
         retained_groups=0,
+        provider_prompt_tokens=provider_tokens,
+        usage_signal=usage_signal,
+        trigger_source=trigger_source,
+        no_eligible_groups=False,
     )
-    if normalized_mode == "off" or canonical_tokens < max(0, int(soft_token_threshold)):
+    if not triggered:
         return ActiveContextProjection(
             messages=canonical_copy, applied=False, failed_open=False, error=None,
             projected_tokens=canonical_tokens, **base,
@@ -279,11 +470,14 @@ def project_active_context(
         compactable = [group for group in groups if group.start not in frontier and _eligible(group)]
         compact_starts = {group.start for group in compactable}
         if not compactable:
+            # Threshold reached but nothing eligible: the request goes out
+            # unchanged.  Flag it so the caller can surface a diagnostic.
             return ActiveContextProjection(
                 messages=canonical_copy, applied=False, failed_open=False, error=None,
                 projected_tokens=canonical_tokens, completed_groups=len(groups),
-                retained_groups=len(groups), **{k: v for k, v in base.items()
-                                               if k not in {"completed_groups", "retained_groups"}},
+                retained_groups=len(groups), no_eligible_groups=True,
+                **{k: v for k, v in base.items()
+                   if k not in {"completed_groups", "retained_groups", "no_eligible_groups"}},
             )
 
         entries = [_receipt_line(groups.index(group) + 1, group) for group in compactable]
@@ -317,6 +511,9 @@ def project_active_context(
             completed_groups=len(groups),
             compacted_groups=len(compactable),
             retained_groups=len(groups) - len(compactable),
+            provider_prompt_tokens=provider_tokens,
+            usage_signal=usage_signal,
+            trigger_source=trigger_source,
         )
     except Exception as exc:
         return ActiveContextProjection(
@@ -331,4 +528,7 @@ def project_active_context(
             completed_groups=0,
             compacted_groups=0,
             retained_groups=0,
+            provider_prompt_tokens=provider_tokens,
+            usage_signal=usage_signal,
+            trigger_source=trigger_source,
         )

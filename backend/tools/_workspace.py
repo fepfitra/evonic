@@ -5,10 +5,35 @@ from typing import Optional
 
 import os
 
+from backend.tools.lib.simulation_scope import (
+    agents_dir as _sim_agents_dir,
+    shared_agents_dir as _sim_shared_agents_dir,
+)
+
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _AGENTS_DIR = os.path.join(_BASE_DIR, 'agents')
 _SHARED_AGENTS_DIR = os.path.join(_BASE_DIR, 'shared', 'agents')
 _SELF_PREFIX = '/_self/'
+
+
+def agents_dir(agent: Optional[dict] = None) -> str:
+    """Simulation-aware ``agents/`` root.
+
+    During a simulation (``agent['simulation_id']`` set) this points under the
+    simulation tree so no ephemeral data lands in the live ``BASE_DIR/agents``.
+    Falls back to the live directory otherwise.
+    """
+    return _sim_agents_dir(agent)
+
+
+def shared_agents_dir(agent: Optional[dict] = None) -> str:
+    """Simulation-aware ``shared/agents/`` root (artifact registry parent).
+
+    During a simulation this points under the simulation tree so artifact
+    writes never touch the authoritative ``BASE_DIR/shared/agents``.
+    Falls back to the live directory otherwise.
+    """
+    return _sim_shared_agents_dir(agent)
 
 
 def scratch_dir(agent_id: str) -> str:
@@ -19,7 +44,7 @@ def scratch_dir(agent_id: str) -> str:
     redirection all resolve here so an agent's scripts and their output stay
     together and never clutter the project workspace.
     """
-    return f"/tmp/evonic-temp/{agent_id or 'default'}-scratchpad"
+    return f"/tmp/evonic-{agent_id or 'default'}-scratchpad"
 
 
 def effective_agent_id(agent: dict) -> str:
@@ -54,21 +79,30 @@ def missing_slash_self_hint(file_path: str) -> Optional[str]:
     return None
 
 
-def resolve_self_path(agent_id: str, file_path: str) -> Optional[str]:
+def resolve_self_path(agent_id: str, file_path: str, agent: dict = None) -> Optional[str]:
     """Resolve /_self/... to the agent's local directory on the evonic server.
 
     Returns the absolute local path, or None if the resolved path escapes
     the agent's directory (path traversal / symlink attack prevention).
+
+    When *agent* carries a simulation context (``simulation_id``) -- or a
+    simulation was activated for the current context via
+    ``simulation_scope.set_active_simulation`` -- the roots are redirected
+    under the simulation tree so an ephemeral template simulation never writes
+    into the live ``agents/<id>/`` or ``shared/agents/<id>/``.
+
+    *agent* is optional so existing 2-argument callers keep working; the
+    simulation contextvar supplies the same information when it is omitted.
     """
     rel = file_path[len(_SELF_PREFIX):] if file_path.startswith(_SELF_PREFIX) else ''
 
     # /_self/artifacts/ resolves to shared/agents/<id>/artifacts/ (not agents/<id>/artifacts/)
     if rel == 'artifacts' or rel.startswith('artifacts/'):
-        base_dir = _SHARED_AGENTS_DIR
-        safe_root = os.path.realpath(os.path.join(_SHARED_AGENTS_DIR, agent_id, 'artifacts'))
+        base_dir = _sim_shared_agents_dir(agent)
+        safe_root = os.path.realpath(os.path.join(base_dir, agent_id, 'artifacts'))
     else:
-        base_dir = _AGENTS_DIR
-        safe_root = os.path.realpath(os.path.join(_AGENTS_DIR, agent_id))
+        base_dir = _sim_agents_dir(agent)
+        safe_root = os.path.realpath(os.path.join(base_dir, agent_id))
 
     abs_path = os.path.normpath(os.path.join(base_dir, agent_id, rel))
     resolved = os.path.realpath(abs_path)
@@ -101,13 +135,13 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
     return prev_row[-1]
 
 
-def list_self_dir(agent_id: str, rel_path: str) -> str:
+def list_self_dir(agent_id: str, rel_path: str, agent: dict = None) -> str:
     """Return a formatted directory listing for a /_self/ path.
 
     Allows agents to verify what files exist in /_self/kb/ etc. without
     relying on bash ls (which cannot resolve /_self/ virtual paths).
     """
-    local_path = resolve_self_path(agent_id, rel_path)
+    local_path = resolve_self_path(agent_id, rel_path, agent)
     if not local_path:
         return f"Error: Access denied — path {rel_path}."
     try:
@@ -125,7 +159,7 @@ def list_self_dir(agent_id: str, rel_path: str) -> str:
     return "\n".join(lines)
 
 
-def _self_fuzzy_suggestion(agent_id: str, file_path: str) -> Optional[str]:
+def _self_fuzzy_suggestion(agent_id: str, file_path: str, agent: dict = None) -> Optional[str]:
     """Return a 'Did you mean: X (edit distance: N)?' hint for /_self/ path typos.
 
     When an LLM hallucinates a typo (e.g. 'jakarta-kemeneu' instead of
@@ -142,7 +176,7 @@ def _self_fuzzy_suggestion(agent_id: str, file_path: str) -> Optional[str]:
     for i in range(len(components), 0, -1):
         prefix_path = '/'.join(components[:i])
         parent_self = _SELF_PREFIX + prefix_path
-        parent_local = resolve_self_path(agent_id, parent_self)
+        parent_local = resolve_self_path(agent_id, parent_self, agent)
 
         if parent_local and os.path.exists(parent_local):
             # Found existing parent. The next component (if any) is the typo.
@@ -185,16 +219,17 @@ def resolve_workspace_path(agent, file_path: str, fallback_workspace: str) -> st
     """Resolve a file path to an absolute path, honoring the agent's workspace.
 
     Rules (in priority order):
-    1. If path starts with '/workspace', strip that prefix and join with the
-       agent's workspace (or fallback_workspace).  This is the runpy-sandbox
-       convention for paths inside a Docker container.
-    2. If path is relative (not absolute) and the agent has a workspace set,
+    1. Preserve an absolute path that is already inside the agent's workspace.
+    2. If path is '/workspace' or starts with '/workspace/', strip that virtual
+       prefix and join with the agent's workspace (or fallback_workspace). This
+       is the runpy-sandbox convention for paths inside a Docker container.
+    3. If path is relative (not absolute) and the agent has a workspace set,
        resolve it relative to that workspace.
-    3. If the agent has a workspace set, validate that the resolved path stays
-       within the workspace boundary using realpath prefix-check.  Absolute
-       paths outside the workspace are blocked by returning a non-existent
-       path that the caller will report as "file not found".
-    4. Otherwise return the path unchanged.
+    4. If the agent has a workspace set, validate that the resolved path stays
+       within the workspace boundary using realpath prefix-check. Absolute paths
+       outside the workspace are blocked by returning a non-existent path that
+       the caller will report as "file not found".
+    5. Otherwise return the path unchanged.
     """
     if not file_path:
         return file_path
@@ -204,10 +239,37 @@ def resolve_workspace_path(agent, file_path: str, fallback_workspace: str) -> st
     # be treated as relative and joined with the workspace base (wrong).
     file_path = os.path.expanduser(file_path)
 
-    if file_path.startswith('/workspace'):
-        workspace_root = (agent or {}).get('workspace') or fallback_workspace
+    # Artifacts registry: /workspace/shared/agents/<id>/artifacts ALWAYS maps to
+    # the HOST registry BASE_DIR/shared/agents/<id>/artifacts that the web UI,
+    # list_artifacts, fetch_artifact and save_artifact serve — independent of
+    # the agent's workspace.  Without this, an agent whose workspace differs
+    # from BASE_DIR (e.g. workspace=agents/<id>/) would resolve the artifacts
+    # path to a workspace-relative COPY that the UI never reads (silent
+    # artifact divergence).  Sandbox backends translate this host registry path
+    # to the container bind path in resolve_path(); local agents use it as-is.
+    if file_path.startswith('/workspace/shared/agents/'):
+        eff_id = effective_agent_id(agent)
+        tail = file_path[len('/workspace/shared/agents/'):]
+        if tail == eff_id or tail.startswith(eff_id + '/'):
+            sub = tail[len(eff_id):].lstrip('/')
+            if sub == 'artifacts' or sub.startswith('artifacts/'):
+                return os.path.join(_sim_shared_agents_dir(agent), eff_id, sub)
+
+    workspace = (agent or {}).get('workspace')
+    if workspace and os.path.isabs(file_path):
+        try:
+            workspace_real = os.path.realpath(workspace)
+            path_real = os.path.realpath(file_path)
+            if path_real == workspace_real or path_real.startswith(workspace_real + os.sep):
+                return file_path
+        except (OSError, PermissionError):
+            pass
+
+    if file_path == '/workspace' or file_path.startswith('/workspace/'):
+        workspace_root = workspace or fallback_workspace
         rel = file_path[len('/workspace'):].lstrip('/')
-        resolved = os.path.join(os.path.abspath(workspace_root), rel)
+        workspace_root_abs = os.path.abspath(workspace_root)
+        resolved = os.path.join(workspace_root_abs, rel) if rel else workspace_root_abs
         # Boundary check
         workspace = (agent or {}).get('workspace')
         if workspace:

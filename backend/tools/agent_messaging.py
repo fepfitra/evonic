@@ -24,7 +24,7 @@ import atexit
 import threading
 from queue import Queue, Empty
 from collections import defaultdict
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.agent_state import AgentState
 from backend.logging_config import get_logger
@@ -121,6 +121,8 @@ _TOOL_DEFS = [
                 "Send a message to another agent on this platform. "
                 "The message is delivered asynchronously — the target agent will process it "
                 "and their reply will be automatically forwarded back to you (fire-and-forget). "
+                "Call this tool directly; do not invoke Evonic's internal messaging executor "
+                "through bash, Python, or another tool. "
                 "Use this for delegation, collaboration, or requesting specialist help. "
                 "By default, the message is delivered to the agent's inter-agent session "
                 "(__agent__&lt;sender-id&gt;). Pass 'session' to target a specific session."
@@ -346,38 +348,18 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
                 )
             }
 
-    # Messaging ACL guard — super agents bypass entirely
-    if not agent_context.get('is_super'):
-        acl_raw = agent_context.get('messaging_acl')
-        if acl_raw:
-            try:
-                acl_list = json.loads(acl_raw) if isinstance(acl_raw, str) else acl_raw
-            except (json.JSONDecodeError, TypeError):
-                acl_list = []
-            if isinstance(acl_list, list) and acl_list:
-                acl_mode = agent_context.get('messaging_acl_mode', 'whitelist')
-                if acl_mode == 'whitelist' and target_id not in acl_list:
-                    _logger.warning(
-                        "ACL blocked: agent '%s' not allowed to message '%s' (not in whitelist).",
-                        sender_id, target_id,
-                    )
-                    return {
-                        'error': (
-                            f"Agent '{sender_id}' is not allowed to message '{target_id}' "
-                            f"(not in messaging whitelist)."
-                        )
-                    }
-                elif acl_mode == 'blacklist' and target_id in acl_list:
-                    _logger.warning(
-                        "ACL blocked: agent '%s' not allowed to message '%s' (in blacklist).",
-                        sender_id, target_id,
-                    )
-                    return {
-                        'error': (
-                            f"Agent '{sender_id}' is not allowed to message '{target_id}' "
-                            f"(in messaging blacklist)."
-                        )
-                    }
+    # Messaging ACL guard — super agents bypass entirely. Shared verbatim
+    # with the artifact-share tool via backend.tools.lib.messaging_acl so both
+    # delivery paths enforce exactly the same policy.
+    from backend.tools.lib.messaging_acl import check_messaging_acl as _check_messaging_acl
+
+    acl_error = _check_messaging_acl(agent_context, target_id)
+    if acl_error:
+        _logger.warning(
+            "ACL blocked: agent '%s' not allowed to message '%s' (messaging ACL).",
+            sender_id, target_id,
+        )
+        return {'error': acl_error}
 
     # Validate target agent
     target_agent = db.get_agent(target_id)
@@ -501,19 +483,38 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
     if session_id:
         metadata['session_id'] = session_id
 
+    # Register synchronous internal waits before dispatch so an immediate reply
+    # cannot beat the waiter into the registry. This option is intentionally not
+    # exposed in the public tool schema.
+    wait_for_reply = bool(args.get('wait_for_reply', False))
+    wait_timeout = _WAIT_TIMEOUT_DEFAULT
+    reply_queue = None
+    if wait_for_reply:
+        wait_timeout = int(args.get('wait_timeout', _WAIT_TIMEOUT_DEFAULT))
+        wait_timeout = max(_WAIT_TIMEOUT_MIN, min(wait_timeout, _WAIT_TIMEOUT_MAX))
+        reply_queue = Queue()
+        with _WAIT_REGISTRY_LOCK:
+            _WAIT_REGISTRY[reply_to_id] = reply_queue
+
     # Deliver via notify_agent (handles routing, dedup, and LLM triggering)
     from backend.agent_runtime.notifier import notify_agent
     target_session = args.get('session', '').strip() if args.get('session') else None
-    result = notify_agent(
-        agent_id=target_id,
-        tag=f"AGENT/{sender_name}",
-        message=message,
-        external_user_id=(f"{_AGENT_MSG_PREFIX}{sender_id}" if not target_session else None),
-        channel_id=None,
-        session_id=target_session,
-        dedup=False,
-        metadata=metadata,
-    )
+    try:
+        result = notify_agent(
+            agent_id=target_id,
+            tag=f"AGENT/{sender_name}",
+            message=message,
+            external_user_id=(f"{_AGENT_MSG_PREFIX}{sender_id}" if not target_session else None),
+            channel_id=None,
+            session_id=target_session,
+            dedup=False,
+            metadata=metadata,
+        )
+    except Exception:
+        if wait_for_reply:
+            with _WAIT_REGISTRY_LOCK:
+                _WAIT_REGISTRY.pop(reply_to_id, None)
+        raise
 
     _logger.info(
         "Agent message sent: '%s' → '%s' (depth=%d, reply_to=%s, report_to=%s, "
@@ -523,6 +524,9 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
     )
 
     if not result.get('success'):
+        if wait_for_reply:
+            with _WAIT_REGISTRY_LOCK:
+                _WAIT_REGISTRY.pop(reply_to_id, None)
         reason = result.get('reason', 'unknown')
         _logger.error(
             "Agent message FAILED: '%s' → '%s', notify_agent reason=%s, result=%s",
@@ -535,15 +539,7 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
         }
 
     # ---- wait_for_reply (internal-only, NOT in tool definition) ----
-    wait_for_reply = args.get('wait_for_reply', False)
     if wait_for_reply:
-        wait_timeout = int(args.get('wait_timeout', _WAIT_TIMEOUT_DEFAULT))
-        wait_timeout = max(_WAIT_TIMEOUT_MIN, min(wait_timeout, _WAIT_TIMEOUT_MAX))
-        reply_queue: Queue = Queue()
-
-        with _WAIT_REGISTRY_LOCK:
-            _WAIT_REGISTRY[reply_to_id] = reply_queue
-
         _logger.info(
             "Agent '%s' waiting for reply from '%s' (reply_to=%s, timeout=%ds).",
             sender_id, target_id, reply_to_id, wait_timeout,
@@ -551,7 +547,9 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
 
         wait_start = time.time()
         try:
-            answer = reply_queue.get(timeout=wait_timeout)
+            from backend.agent_runtime.concurrency import paused_model_gate
+            with paused_model_gate():
+                answer = reply_queue.get(timeout=wait_timeout)
             elapsed = time.time() - wait_start
             _logger.info(
                 "Agent '%s' received reply from '%s' after %.1fs (reply_to=%s).",
@@ -574,8 +572,6 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
                 "Agent '%s' wait_for_reply timed out after %ds for '%s' (reply_to=%s).",
                 sender_id, wait_timeout, target_id, reply_to_id,
             )
-            with _WAIT_REGISTRY_LOCK:
-                _WAIT_REGISTRY.pop(reply_to_id, None)
             return {
                 'success': True,
                 'wait_for_reply': True,
@@ -592,8 +588,6 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
                 "Agent '%s' wait_for_reply error for '%s': %s",
                 sender_id, target_id, e,
             )
-            with _WAIT_REGISTRY_LOCK:
-                _WAIT_REGISTRY.pop(reply_to_id, None)
             return {
                 'success': True,
                 'wait_for_reply': True,
@@ -603,6 +597,9 @@ def _exec_send_agent_message(args: dict, agent_context: dict) -> dict:
                     "The reply will arrive in your next turn."
                 ),
             }
+        finally:
+            with _WAIT_REGISTRY_LOCK:
+                _WAIT_REGISTRY.pop(reply_to_id, None)
 
     return {
         'success': True,
@@ -745,7 +742,9 @@ def _exec_resolve_agent_approval(args: dict, agent_context: dict) -> dict:
         _logger.warning("Approval '%s' already resolved as '%s'.", approval_id, pa.decision)
         return {'error': f'Approval already resolved: {pa.decision}.'}
 
-    resolved = approval_registry.resolve(approval_id, decision)
+    _by = agent_context.get('id') or agent_context.get('agent_id') or 'agent'
+    resolved = approval_registry.resolve(approval_id, decision,
+                                         resolved_by=f'agent:{_by}')
     if not resolved:
         _logger.warning("Approval '%s' could not be resolved (just expired).", approval_id)
         return {'error': 'Could not resolve approval (may have just expired).'}
@@ -759,6 +758,63 @@ def _exec_resolve_agent_approval(args: dict, agent_context: dict) -> dict:
 
 
 # ==================== Fire-and-Forget: auto-forward B's reply to A ====================
+
+
+def _lookup_human_session_id(
+    agent_id: str, external_user_id: str, channel_id: Optional[str],
+) -> Optional[str]:
+    """Read-only session lookup that never creates a session as a side effect."""
+    lookup = getattr(db, 'get_session_id', None)
+    if lookup is None:
+        return None
+    try:
+        return lookup(agent_id, external_user_id, channel_id)
+    except Exception:
+        _logger.debug(
+            "Auto-forward: human session lookup failed for '%s' (agent=%s).",
+            external_user_id, agent_id, exc_info=True,
+        )
+        return None
+
+
+def _has_live_user_escalation(
+    session_id: Optional[str], originating_agent_id: str,
+) -> bool:
+    """True only when persisted state proves a delivered, unexpired escalation.
+
+    Deliberately strict: anything other than a definite ``True`` (None, a
+    MagicMock in tests, a database without the helper) leaves the normal
+    auto-forward path untouched, so this guard can never swallow a reply by
+    accident.
+    """
+    if not session_id:
+        return False
+    probe = getattr(db, 'has_pending_user_escalation', None)
+    if probe is None:
+        return False
+    try:
+        pending = probe(session_id, originating_agent_id=originating_agent_id)
+    except Exception:
+        _logger.warning(
+            "Auto-forward: escalation probe failed for session '%s'.",
+            session_id, exc_info=True,
+        )
+        return False
+    return pending is True
+
+
+def _target_human_session_id(
+    meta_session_id: Optional[str],
+    report_to_id: str,
+    sender_id: str,
+    channel_id: Optional[str],
+) -> Optional[str]:
+    """Resolve the human session an auto-forward would land in, if any."""
+    if report_to_id.startswith(_AGENT_MSG_PREFIX):
+        return None  # Chained delegation: no human session is involved.
+    if meta_session_id:
+        return meta_session_id
+    return _lookup_human_session_id(sender_id, report_to_id, channel_id)
 
 
 def _on_final_answer(data: dict) -> None:
@@ -813,19 +869,36 @@ def _on_final_answer(data: dict) -> None:
         )
         return
 
-    if not meta or meta.get('from_agent_id') != sender_id or not meta.get('report_to_id'):
+    if not meta or meta.get('from_agent_id') != sender_id:
         _logger.warning(
-            "Auto-forward skip: no routable request metadata found for sender '%s' in session '%s'.",
+            "Auto-forward skip: no matching request metadata found for sender '%s' in session '%s'.",
             sender_id, session_id,
         )
         return
 
-    report_to_id = meta['report_to_id']
+    reply_to_id = meta.get('reply_to_id')
+    if reply_to_id:
+        with _WAIT_REGISTRY_LOCK:
+            reply_queue = _WAIT_REGISTRY.pop(reply_to_id, None)
+        if reply_queue is not None:
+            reply_queue.put_nowait(answer)
+            _logger.info(
+                "Wait registry: woke up waiter for reply_to=%s (sender=%s, agent_b=%s).",
+                reply_to_id, sender_id, agent_b_id,
+            )
+
+    report_to_id = meta.get('report_to_id')
+    if not report_to_id:
+        _logger.warning(
+            "Auto-forward skip: request from '%s' in session '%s' has no human route.",
+            sender_id, session_id,
+        )
+        return
+
     report_to_channel_id = meta.get('report_to_channel_id') or None
     session_id_from_meta = meta.get('session_id')
     original_depth = meta.get('agent_message_depth', 0)
     subagent_user_direct = meta.get('subagent_user_direct', False)
-    reply_to_id = meta.get('reply_to_id')
     skip_auto_forward = meta.get('skip_auto_forward', False)
 
     if skip_auto_forward:
@@ -844,6 +917,24 @@ def _on_final_answer(data: dict) -> None:
             "Auto-forward skip: report_to_id '%s' would create a self-session for '%s'. "
             "Possible cause: stale inter-agent report_to_id in message metadata.",
             report_to_id, agent_b_id,
+        )
+        return
+
+    # Guard: a live human escalation in the destination session owns the next
+    # inbound human reply. Forwarding A's answer there would make the runtime
+    # treat that forward as the human answer and echo A's own words back to the
+    # delegated agent as a fake reply. The escalation delivery already surfaced
+    # the human-facing question, so suppress this forward while the correlation
+    # is live. Decided purely from persisted row state — no timing heuristics.
+    target_session_id = _target_human_session_id(
+        session_id_from_meta, report_to_id, sender_id, report_to_channel_id,
+    )
+    if _has_live_user_escalation(target_session_id, sender_id):
+        _logger.info(
+            "Auto-forward skip: reply from '%s' in session '%s' suppressed — "
+            "a pending user escalation for '%s' owns the next human reply "
+            "(target_session=%s).",
+            agent_b_id, session_id, sender_id, target_session_id,
         )
         return
 
@@ -883,6 +974,7 @@ def _on_final_answer(data: dict) -> None:
                 'from_agent_id': agent_b_id,
                 'from_agent_name': agent_b_name,
                 'agent_reply': True,
+                'skip_escalation_consume': True,
                 'report_to_id': report_to_id,
                 'agent_message_depth': original_depth,
                 'reply_to_agent_id': agent_b_id,
@@ -914,23 +1006,6 @@ def _on_final_answer(data: dict) -> None:
         _logger.error(
             "Auto-forward failed for '%s' → '%s': %s", agent_b_id, sender_id, e,
         )
-
-    # ---- wake-up: signal any waiting send_agent_message(wait_for_reply=true) ----
-    if reply_to_id:
-        with _WAIT_REGISTRY_LOCK:
-            q = _WAIT_REGISTRY.pop(reply_to_id, None)
-        if q is not None:
-            try:
-                q.put(answer, timeout=1)
-                _logger.info(
-                    "Wait registry: woke up waiter for reply_to=%s (sender=%s, agent_b=%s).",
-                    reply_to_id, sender_id, agent_b_id,
-                )
-            except Exception:
-                _logger.warning(
-                    "Wait registry: failed to wake waiter for reply_to=%s (full queue?).",
-                    reply_to_id,
-                )
 
 # NOTE: _on_final_answer listener is registered in
 # backend/agent_runtime/__init__.py at startup, not here,
@@ -1116,17 +1191,27 @@ def _exec_send_channel_message(args: dict, agent_context: dict) -> dict:
 
     # ---- Record in chat log ----
     try:
-        db.add_chat_message(
+        message_id = db.add_chat_message(
             session_id, 'assistant', message,
             agent_id=sender_id,
             metadata={'channel_send': True},
         )
+        message_id = message_id if type(message_id) in (int, str) else None
         from models.chatlog import chatlog_manager
         chatlog_manager.get(sender_id, session_id).append({
             'type': 'final',
             'session_id': session_id,
             'content': message,
             'metadata': {'channel_send': True},
+            'message_id': message_id,
+        })
+        from backend.event_stream import event_stream
+        event_stream.emit('message_received', {
+            'agent_id': sender_id, 'session_id': session_id,
+            'external_user_id': external_user_id, 'channel_id': channel_id,
+            'message': message, 'message_id': message_id,
+            'metadata': {'channel_send': True},
+            'role': 'assistant', 'sender': sender_id,
         })
     except Exception as e:
         _logger.warning("send_channel_message: chat log error: %s", e)

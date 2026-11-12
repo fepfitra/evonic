@@ -12,6 +12,7 @@ import unittest
 import unittest.mock as mock
 import sys
 import os
+from contextlib import nullcontext
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -87,9 +88,14 @@ def setup_module(module):
     _models_stub = types.ModuleType('models')
     _models_stub.__path__ = [os.path.join(_repo_root, 'models')]
     # Submodules that conftest's isolate_agent_dirs fixture monkeypatches by
-    # name (models.chat / models.chatlog) must be present as attributes.
-    _models_stub.chat = mock.MagicMock()
-    _models_stub.chatlog = mock.MagicMock()
+    # name (models.chat / models.chatlog) must be present as attributes. Plain
+    # modules, not MagicMocks: since pytest 9.2, monkeypatch.undo() deletes an
+    # attribute it does not find in the target's __dict__, and a deleted
+    # MagicMock child then raises AttributeError for every later test.
+    _models_stub.chat = types.ModuleType('models.chat')
+    _models_stub.chat.AGENTS_DIR = _models_stub.chat.SUB_AGENTS_TMP_DIR = ''
+    _models_stub.chatlog = types.ModuleType('models.chatlog')
+    _models_stub.chatlog._AGENTS_DIR = ''
     sys.modules['models'] = _models_stub
 
     _notifier_stub = types.ModuleType('backend.agent_runtime.notifier')
@@ -101,6 +107,7 @@ def setup_module(module):
     sys.modules['backend.agent_runtime.approval'] = _approval_stub
 
     _ar_stub = types.ModuleType('backend.agent_runtime')
+    _ar_stub.__path__ = [os.path.join(_repo_root, 'backend', 'agent_runtime')]
     _ar_stub.agent_runtime = mock.MagicMock()
     _ar_stub.notifier = _notifier_stub
     _ar_stub.approval = _approval_stub
@@ -263,6 +270,43 @@ class TestExecSendAgentMessage(unittest.TestCase):
         self.assertTrue(meta.get('agent_message'))
         self.assertEqual(meta.get('from_agent_id'), 'agent_a')
         self.assertEqual(meta.get('report_to_id'), 'user_123')
+
+    def test_immediate_reply_wakes_waiter_without_human_route(self):
+        """The waiter exists before notify_agent can synchronously finish the target."""
+        from backend.tools.agent_messaging import _on_final_answer
+
+        concurrency_stub = types.ModuleType('backend.agent_runtime.concurrency')
+        concurrency_stub.paused_model_gate = nullcontext
+
+        def immediate_reply(**kwargs):
+            with mock.patch(
+                'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+                return_value=kwargs['metadata'],
+            ):
+                _on_final_answer({
+                    'external_user_id': '__agent__agent_a',
+                    'agent_id': 'agent_b',
+                    'session_id': 'delegated-session',
+                    'answer': 'Hello immediately',
+                })
+            return {'success': True}
+
+        target = _make_target_agent()
+        with mock.patch('backend.tools.agent_messaging.db.get_agent', return_value=target), \
+             mock.patch('backend.agent_runtime.notifier.notify_agent', side_effect=immediate_reply), \
+             mock.patch.dict(sys.modules, {
+                 'backend.agent_runtime.concurrency': concurrency_stub,
+             }):
+            result = self._call({
+                'target_agent_id': 'agent_b',
+                'message': 'Hello',
+                'wait_for_reply': True,
+                'wait_timeout': 10,
+            }, agent_context=_make_agent_context(user_id='', session_id=''))
+
+        self.assertTrue(result.get('success'))
+        self.assertEqual(result.get('reply'), 'Hello immediately')
+        self.assertFalse(result.get('timed_out', False))
 
     def test_self_messaging_blocked(self):
         """Agent cannot message itself."""
@@ -887,6 +931,31 @@ class TestOnFinalAnswer(unittest.TestCase):
             self._call(self._build_data())
         mock_notify.assert_not_called()
 
+    def test_no_report_to_id_still_wakes_internal_waiter(self):
+        """Synchronous callers do not depend on browser auto-forward routing."""
+        from backend.tools.agent_messaging import (
+            _WAIT_REGISTRY, _WAIT_REGISTRY_LOCK, Queue,
+        )
+        reply_queue = Queue()
+        with _WAIT_REGISTRY_LOCK:
+            _WAIT_REGISTRY['reply-1'] = reply_queue
+        metadata = {
+            'agent_message': True,
+            'from_agent_id': 'agent_a',
+            'reply_to_id': 'reply-1',
+        }
+        try:
+            with mock.patch(
+                'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+                return_value=metadata,
+            ), mock.patch('backend.agent_runtime.notifier.notify_agent') as mock_notify:
+                self._call(self._build_data(answer='Wait result'))
+            self.assertEqual(reply_queue.get_nowait(), 'Wait result')
+            mock_notify.assert_not_called()
+        finally:
+            with _WAIT_REGISTRY_LOCK:
+                _WAIT_REGISTRY.pop('reply-1', None)
+
     def test_inter_agent_forwards_reply(self):
         """Inter-agent session with valid metadata forwards reply to A."""
         messages = [
@@ -1081,6 +1150,127 @@ class TestOnFinalAnswer(unittest.TestCase):
         mock_notify.assert_called_once()
         forwarded_meta = mock_notify.call_args.kwargs.get('metadata', {})
         self.assertEqual(forwarded_meta.get('agent_message_depth'), 0)
+
+
+# -------------------------------------------------------
+# _on_final_answer — pending-escalation suppression
+# -------------------------------------------------------
+
+class TestOnFinalAnswerEscalationSuppression(unittest.TestCase):
+    """The auto-forward must never collide with a pending human escalation.
+
+    An escalation delivered into A's human session owns the next inbound human
+    reply. Forwarding A's own answer there would make the runtime consume the
+    correlation and echo A's text back to the delegated agent as a fake human
+    answer (observed in siwa-d1ea6763).
+    """
+
+    human_meta = {
+        'from_agent_id': 'agent_a',
+        'report_to_id': 'user_123',
+        'report_to_channel_id': 'channel-1',
+        'session_id': 'human-session',
+        'agent_message_depth': 1,
+    }
+
+    def _call(self, answer='Task done!'):
+        from backend.tools.agent_messaging import _on_final_answer
+        _on_final_answer({
+            'external_user_id': '__agent__agent_a',
+            'agent_id': 'agent_b',
+            'session_id': 'delegated-session',
+            'answer': answer,
+        })
+
+    def test_pending_escalation_suppresses_auto_forward(self):
+        """Escalate then finish the turn: no forward, no consumption."""
+        with mock.patch(
+            'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+            return_value=self.human_meta,
+        ), mock.patch(
+            'backend.tools.agent_messaging.db.has_pending_user_escalation',
+            return_value=True,
+        ) as probe, mock.patch(
+            'backend.tools.agent_messaging.db.consume_pending_user_escalation',
+        ) as consume, mock.patch(
+            'backend.agent_runtime.notifier.notify_agent',
+        ) as notify:
+            self._call()
+
+        probe.assert_called_once_with(
+            'human-session', originating_agent_id='agent_a',
+        )
+        consume.assert_not_called()
+        notify.assert_not_called()
+
+    def test_no_pending_escalation_still_forwards_and_marks_skip(self):
+        """Plain delegation keeps auto-forwarding and tags the metadata."""
+        target_agent = _make_target_agent(agent_id='agent_b', name='Agent B')
+        with mock.patch(
+            'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+            return_value=self.human_meta,
+        ), mock.patch(
+            'backend.tools.agent_messaging.db.has_pending_user_escalation',
+            return_value=False,
+        ), mock.patch(
+            'backend.tools.agent_messaging.db.get_agent',
+            return_value=target_agent,
+        ), mock.patch(
+            'backend.agent_runtime.notifier.notify_agent',
+            return_value={'success': True, 'session_id': 'human-session'},
+        ) as notify:
+            self._call(answer='Report ready.')
+
+        notify.assert_called_once()
+        forwarded = notify.call_args.kwargs['metadata']
+        self.assertTrue(forwarded['agent_reply'])
+        self.assertTrue(forwarded['skip_escalation_consume'])
+        self.assertEqual(notify.call_args.kwargs['session_id'], 'human-session')
+
+    def test_missing_origin_session_uses_read_only_lookup(self):
+        """Without a metadata session id the target session is looked up, not created."""
+        meta = dict(self.human_meta)
+        meta.pop('session_id')
+        with mock.patch(
+            'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+            return_value=meta,
+        ), mock.patch(
+            'backend.tools.agent_messaging.db.get_session_id',
+            return_value='resolved-session',
+        ) as lookup, mock.patch(
+            'backend.tools.agent_messaging.db.has_pending_user_escalation',
+            return_value=True,
+        ) as probe, mock.patch(
+            'backend.agent_runtime.notifier.notify_agent',
+        ) as notify:
+            self._call()
+
+        lookup.assert_called_once_with('agent_a', 'user_123', 'channel-1')
+        probe.assert_called_once_with(
+            'resolved-session', originating_agent_id='agent_a',
+        )
+        notify.assert_not_called()
+
+    def test_inter_agent_chain_does_not_probe_escalations(self):
+        """Chained delegation has no human session, so nothing can be consumed."""
+        meta = dict(self.human_meta)
+        meta['report_to_id'] = '__agent__agent_x'
+        target_agent = _make_target_agent(agent_id='agent_b', name='Agent B')
+        with mock.patch(
+            'backend.tools.agent_messaging.db.get_latest_agent_request_metadata',
+            return_value=meta,
+        ), mock.patch(
+            'backend.tools.agent_messaging.db.has_pending_user_escalation',
+        ) as probe, mock.patch(
+            'backend.tools.agent_messaging.db.get_agent',
+            return_value=target_agent,
+        ), mock.patch(
+            'backend.agent_runtime.notifier.notify_agent',
+        ) as notify:
+            self._call()
+
+        probe.assert_not_called()
+        notify.assert_called_once()
 
 
 # -------------------------------------------------------

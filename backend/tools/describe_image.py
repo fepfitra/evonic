@@ -39,6 +39,13 @@ _SUPPORTED_IMAGE_TYPES = frozenset({
     "image/bmp",
 })
 
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+try:
+    from config import SANDBOX_WORKSPACE as _WORKSPACE_ROOT
+except ImportError:
+    _WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
 # Cached check for ffmpeg availability (lazy, checked once at module level).
 _ffmpeg_path: Optional[str] = None
 _ffmpeg_checked: bool = False
@@ -228,6 +235,13 @@ def _resolve_vision_models(agent: dict) -> tuple[list, Optional[str]]:
     )
 
 
+def _format_vision_model_label(index: int, model: dict) -> str:
+    """Return a user-facing fallback position and identifier for a vision model."""
+    position = "primary model" if index == 0 else f"fallback model {index}"
+    identifier = model.get("name") or model.get("id") or "unknown"
+    return f"{position} ({identifier})"
+
+
 def _find_closest_attachment(agent_id: str, orig_path: str) -> Optional[str]:
     """Search the agent's data/attachments directory for a close filename match.
 
@@ -253,6 +267,80 @@ def _find_closest_attachment(agent_id: str, orig_path: str) -> Optional[str]:
     if best_ratio > 0.7 and best_path:
         return best_path
     return None
+
+
+def _read_image(agent: dict, path: str) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Read an image from the host first, then the agent's execution backend."""
+    from backend.tools._workspace import (
+        effective_agent_id,
+        is_self_path,
+        resolve_self_path,
+        resolve_workspace_path,
+    )
+
+    agent = agent or {}
+    host_path = path
+    self_path = is_self_path(path)
+    if self_path:
+        host_path = resolve_self_path(effective_agent_id(agent), path)
+        if not host_path:
+            return None, None, "Error: Access denied — path escapes agent directory."
+
+    if os.path.isfile(host_path):
+        try:
+            file_size = os.path.getsize(host_path)
+            if file_size > _MAX_IMAGE_BYTES:
+                return None, None, (
+                    f"Error: Image file is {file_size / (1024 * 1024):.1f} MB, "
+                    "which exceeds the 10 MB limit."
+                )
+            with open(host_path, "rb") as handle:
+                image_data = handle.read(_MAX_IMAGE_BYTES + 1)
+        except PermissionError:
+            return None, None, f"Error: Permission denied — cannot read: {path}"
+        except Exception as exc:
+            return None, None, f"Error: Failed to read image: {exc}"
+        if len(image_data) > _MAX_IMAGE_BYTES:
+            return None, None, "Error: Image file exceeds the 10 MB limit."
+        return image_data, host_path, None
+
+    if self_path:
+        return None, None, f"Error: File not found: {path}"
+
+    try:
+        from backend.tools.lib.exec_backend import registry
+
+        backend = registry.get_backend(agent.get("session_id") or "default", agent)
+        target = resolve_workspace_path(agent, path, _WORKSPACE_ROOT)
+        target = backend.resolve_path(target)
+        stat = backend.file_stat(target)
+    except Exception as exc:
+        return None, None, f"Error: Failed to access execution environment: {exc}"
+
+    if not stat.get("exists"):
+        suggestion = _find_closest_attachment(agent.get("id", ""), path)
+        suffix = f". Did you mean: {suggestion}?" if suggestion else ""
+        return None, None, f"Error: File not found: {path}{suffix}"
+
+    file_size = int(stat.get("size") or 0)
+    if file_size > _MAX_IMAGE_BYTES:
+        return None, None, (
+            f"Error: Image file is {file_size / (1024 * 1024):.1f} MB, "
+            "which exceeds the 10 MB limit."
+        )
+
+    try:
+        result = backend.cat_file_bytes(target)
+    except Exception as exc:
+        return None, None, f"Error: Failed to read image: {exc}"
+    if "error" in result:
+        return None, None, f"Error: Failed to read image: {result['error']}"
+    image_data = result.get("bytes")
+    if not isinstance(image_data, bytes):
+        return None, None, "Error: Failed to read image: execution backend returned invalid data."
+    if len(image_data) > _MAX_IMAGE_BYTES:
+        return None, None, "Error: Image file exceeds the 10 MB limit."
+    return image_data, None, None
 
 
 def execute(agent: dict, args: dict) -> Any:
@@ -291,36 +379,23 @@ def execute(agent: dict, args: dict) -> Any:
     if not path:
         return "Error: 'path' parameter is required. Provide the file path to the image."
 
-    # Resolve /_self/ virtual paths (e.g. /_self/artifacts/foo.webp)
-    agent_id = (agent or {}).get("id", "")
-    if agent_id:
-        from backend.tools._workspace import is_self_path, resolve_self_path, effective_agent_id
-        if is_self_path(path):
-            resolved = resolve_self_path(effective_agent_id(agent), path)
-            if resolved:
-                path = resolved
-
-    if not os.path.isfile(path):
-        suggestion = _find_closest_attachment(agent_id, path)
-        if suggestion:
-            return f"Error: File not found: {path}. Did you mean: {suggestion}?"
-        return f"Error: File not found: {path}"
+    image_data, host_path, read_error = _read_image(agent, path)
+    if read_error:
+        return read_error
 
     # If the agent operates in a remote workplace (SSH/tunnel/etc.), ensure the
-    # image file is also available on the remote filesystem so the agent can
-    # reference it via bash, runpy, or other backend-routed tools.
-    try:
-        from backend.tools._ensure_workplace_file import ensure_workplace_file
-        ensure_workplace_file(path, agent)
-    except (ImportError, RuntimeError):
-        pass  # Non-critical: file is already accessible from the host side
+    # host image is also available there. Backend images need no staging.
+    if host_path:
+        try:
+            from backend.tools._ensure_workplace_file import ensure_workplace_file
+            ensure_workplace_file(host_path, agent)
+        except (ImportError, RuntimeError):
+            pass
 
-    file_size = os.path.getsize(path)
-    if file_size > 10 * 1024 * 1024:  # 10 MB
-        return f"Error: Image file is {file_size / (1024*1024):.1f} MB, which exceeds the 10 MB limit."
+    file_size = len(image_data)
 
     # --- Detect MIME type ---
-    mime_type, _ = mimetypes.guess_type(path)
+    mime_type, _ = mimetypes.guess_type(host_path or path)
     # mimetypes may not know .webp or other newer formats on some systems.
     # Fall back to extension-based detection when mimetypes returns unknown.
     if not mime_type:
@@ -331,22 +406,13 @@ def execute(agent: dict, args: dict) -> Any:
             '.webp': 'image/webp',
             '.bmp': 'image/bmp',
         }
-        mime_type = _ext_map.get(os.path.splitext(path)[1].lower())
+        mime_type = _ext_map.get(os.path.splitext(host_path or path)[1].lower())
     if not mime_type or mime_type not in _SUPPORTED_IMAGE_TYPES:
         detected = mime_type or "unknown"
         return (
             f"Error: Unsupported image type '{detected}'. "
             f"Supported formats: JPEG, PNG, GIF, WebP, BMP."
         )
-
-    # --- Read image and encode as base64 ---
-    try:
-        with open(path, "rb") as f:
-            image_data = f.read()
-    except PermissionError:
-        return f"Error: Permission denied — cannot read: {path}"
-    except Exception as e:
-        return f"Error: Failed to read image: {e}"
 
     # --- Auto-convert / compress to JPEG if needed ---
     image_data, resolved_mime = _preprocess_image(image_data, mime_type, file_size)
@@ -405,8 +471,8 @@ def execute(agent: dict, args: dict) -> Any:
         "auth_error",
     })
 
-    for vision_model in vision_models:
-        model_name = vision_model.get("name", vision_model.get("id", "unknown"))
+    for model_index, vision_model in enumerate(vision_models):
+        model_label = _format_vision_model_label(model_index, vision_model)
         try:
             client = LLMClient(model_config=vision_model)
             # Enforce a 2-minute (120s) maximum timeout for vision model calls,
@@ -420,7 +486,7 @@ def execute(agent: dict, args: dict) -> Any:
         except Exception as e:
             # Unexpected exception — treat as transient failure, try next
             failures += 1
-            last_error = f"{model_name}: {e}"
+            last_error = f"{model_label}: {e}"
             continue
 
         if result.get("success"):
@@ -431,12 +497,15 @@ def execute(agent: dict, args: dict) -> Any:
         error_detail = result.get("error_detail", "")
         if error_type in _FALLBACK_ERROR_TYPES:
             failures += 1
-            last_error = f"{model_name}: {error_detail or error_type}"
+            last_error = f"{model_label}: {error_detail or error_type}"
             continue  # Try next model
 
         # Non-recoverable error (e.g. malformed request, unsupported content) —
         # fail immediately.
-        return f"Error: Vision model call failed ({error_type}): {error_detail}"
+        return (
+            f"Error: Vision model call failed for {model_label} "
+            f"({error_type}): {error_detail}"
+        )
 
     if result is None or not result.get("success"):
         return (

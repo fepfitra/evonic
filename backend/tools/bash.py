@@ -4,24 +4,27 @@ bash — Bash script execution via the active execution backend.
 The backend is resolved per-session from the backend registry:
   - Default: DockerBackend (sandboxed Docker container, shared with runpy)
   - If sandbox_enabled=0: LocalBackend (direct host subprocess)
-  - If sshc is connected: SSHBackend (remote server)
+  - If a remote workplace is active: RemoteWorkplaceBackend/SSHBackend (remote server)
 
 New backends (E2B, etc.) plug in without changing this file.
 """
 
 import logging
-import re
+from typing import Optional
 
+from backend.tools.lib.agent_env import build_agent_env
 from backend.tools.lib.exec_backend import registry, validate_env_keys
-
-_VALID_ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+from backend.tools.lib.shell_path import ensure_path_env
 
 try:
-    from backend.tools.lib.safety_pipeline import get_safety_pipeline, should_skip_safety
+    from backend.tools.lib.safety_pipeline import (
+        get_safety_pipeline, should_skip_safety, verdict_provenance,
+    )
 except ImportError:
     logging.getLogger(__name__).warning("safety_pipeline unavailable — safety checks disabled for bash tool")
     get_safety_pipeline = None
     should_skip_safety = lambda agent: True
+    verdict_provenance = lambda safety: {}
 
 try:
     from backend.tools.lib.heuristic_safety import check_root_filesystem_scan
@@ -45,6 +48,49 @@ def _get_long_running_setting() -> bool:
         return val == '1'
     except Exception:
         return True
+
+
+def _root_fs_scan_guard_enabled() -> bool:
+    """Check whether the root filesystem scan guard is enabled.
+
+    Priority: env var RFS_GUARD_DISABLED=1 force-disables it (config.py).
+    Otherwise, falls back to the 'root_fs_scan_guard_enabled' DB setting
+    (defaults to '1' = enabled; toggled in System > Settings UI).
+    Fails safe to True when config or the database cannot be read.
+    """
+    try:
+        import config as _cfg
+        if not _cfg.ROOT_FS_SCAN_GUARD_ENABLED:
+            return False
+    except Exception:
+        return True
+    try:
+        from models.db import db
+        val = db.get_setting('root_fs_scan_guard_enabled', '1')
+        return val == '1'
+    except Exception:
+        return True
+
+
+def _update_decim_disposition(event_id, result=None, disposition=None):
+    """Record the lifecycle outcome on the matching Decim telemetry event.
+
+    The event id is produced by the safety pipeline and kept internal; it is
+    never returned to the tool caller.  ``disposition`` may be passed explicitly
+    (blocked/approval_requested); otherwise it is derived from the backend
+    ``result`` (executed/execution_failed).  Failures here never affect execution.
+    """
+    if not event_id:
+        return
+    try:
+        from backend.services import decim_safety_telemetry
+        if disposition is None:
+            data = result or {}
+            failed = bool(data.get('error')) or data.get('exit_code', 0) != 0
+            disposition = 'execution_failed' if failed else 'executed'
+        decim_safety_telemetry.update_disposition(event_id, disposition)
+    except Exception:
+        pass
 
 
 def execute(agent: dict, args: dict) -> dict:
@@ -86,10 +132,11 @@ def execute(agent: dict, args: dict) -> dict:
                 f"Do NOT retry the command directly — it will be blocked again.\n\n"
                 f"REQUIRED: Copy and execute this exact script as your next bash call:\n"
                 f"```\n{lr['run_script']}\n```\n\n"
-                f"Once started, the process is monitored automatically — you will "
-                f"receive a system notification when it finishes, so do NOT poll "
-                f"for completion in a loop. Continue with other work or end your "
-                f"turn. To peek at output meanwhile: {lr['monitor_script']}"
+                f"It runs unwatched — nothing will notify you when it finishes. "
+                f"If the outcome matters, call the `monitor` tool on the job_id "
+                f"returned by that bash call and you will be told once, when "
+                f"your condition is met. Either way do NOT poll in a loop. "
+                f"To peek at output: {lr['monitor_script']}"
             ),
         }
 
@@ -97,39 +144,80 @@ def execute(agent: dict, args: dict) -> dict:
     # Root filesystem scan guard (performance concern, e.g. `find /`, `tree /`).
     # Independent of the safety pipeline on purpose: it fires for ALL agents —
     # including super agents and agents with safety_checker_enabled=0 — because a
-    # full-root scan is a performance hazard regardless of trust. We still honour
-    # `_skip_safety` (set on the post-approval re-execution) so an approved scan
-    # runs instead of re-prompting forever.
+    # full-root scan is a performance hazard regardless of trust. It therefore has its
+    # own switch (RFS_GUARD_DISABLED=1 env var force-disables it; otherwise the
+    # root_fs_scan_guard_enabled DB setting toggled in System > Settings applies),
+    # NOT the per-agent safety checker toggle. The scan is auto-rejected (no approval
+    # prompt) so the agent falls back to a scoped search instead of stalling the turn.
+    # We still honour `_skip_safety` (set on the post-approval re-execution) so a
+    # script a human already approved runs as approved.
     # ------------------------------------------------------------------
-    if not should_skip_safety(agent):
+    if _root_fs_scan_guard_enabled() and not should_skip_safety(agent):
         _rfs = check_root_filesystem_scan(script)
         if _rfs:
             return {
-                'error': 'Script requires manual approval before execution',
-                'level': 'requires_approval',
+                'error': (
+                    "REJECTED: Root filesystem scan (`find /`, `tree /`) is not allowed — "
+                    "it walks the entire filesystem and can stall the turn. "
+                    "Do NOT retry it, it will be rejected again.\n\n"
+                    "Explore another way instead:\n"
+                    "- Scope the search to a likely directory (e.g. the working "
+                    "directory, $HOME, /etc, /usr/local, /opt, /var/log).\n"
+                    "- Limit depth, e.g. `find /etc -maxdepth 3 -name '*.conf'` or "
+                    "`ls -la /` to see top-level directories first.\n"
+                    "- Use targeted lookups: `which <cmd>`, `command -v <cmd>`, "
+                    "`locate <name>` (if available), or `grep -rl <text> <dir>`."
+                ),
+                'level': 'dangerous',
                 'score': _rfs['score'],
                 'reasons': _rfs['reasons'],
                 'blocked_patterns': _rfs['blocked_patterns'],
-                'approval_info': _rfs['approval_info'],
+                '_safety': {
+                    'source': 'guard', 'mode': 'root_fs_scan', 'level': 'dangerous',
+                    'decision': 'block', 'model_decision': None, 'confidence': None,
+                    'event_id': None,
+                    'blocked_patterns': list(_rfs['blocked_patterns'])[:6],
+                    'reasons': list(_rfs['reasons'])[:4],
+                },
             }
 
     # ------------------------------------------------------------------
     # HMADS safety check (pipeline: system rules + custom user rules)
     # ------------------------------------------------------------------
-    if get_safety_pipeline is not None and not should_skip_safety(agent) and agent.get('safety_checker_enabled', 1) and not agent.get('is_super'):        safety = get_safety_pipeline().check(script, tool_type='bash', agent_context=agent)
+    if get_safety_pipeline is not None and not should_skip_safety(agent) and agent.get('safety_checker_enabled', 1) and not agent.get('is_super'):
+        safety = get_safety_pipeline().check(script, tool_type='bash', agent_context=agent)
     else:
         safety = {'level': 'safe', 'score': 0, 'reasons': [], 'blocked_patterns': [], 'approval_info': {}}
 
+    # Decim Safety correlation id (internal only; never returned to the caller).
+    _decim_event_id = (safety.get('decim_safety') or {}).get('event_id')
+    # Compact, UI-safe provenance for the chat timeline.  The LLM loop pops it
+    # before the result reaches the model or the user-visible output.
+    _safety_prov = verdict_provenance(safety)
+
     if safety['level'] == 'dangerous':
+        # A block that never reached Decim still has to be recorded: without it
+        # the refusal is invisible and the positive class can never accumulate.
+        if _decim_event_id is None and get_safety_pipeline is not None:
+            _decim_event_id = get_safety_pipeline().record_refusal(
+                script, tool_type='bash', agent_context=agent, verdict=safety)
+        _update_decim_disposition(_decim_event_id, None, 'blocked')
         return {
             'error': 'Execution blocked by heuristic safety system',
             'level': 'dangerous',
             'score': safety['score'],
             'reasons': safety['reasons'],
             'blocked_patterns': safety['blocked_patterns'],
+            '_safety': _safety_prov,
         }
 
     if safety['level'] == 'requires_approval':
+        # Same reasoning as the block path: an escalation raised by the rules
+        # alone is still a high-stakes attempt worth keeping.
+        if _decim_event_id is None and get_safety_pipeline is not None:
+            _decim_event_id = get_safety_pipeline().record_refusal(
+                script, tool_type='bash', agent_context=agent, verdict=safety)
+        _update_decim_disposition(_decim_event_id, None, 'approval_requested')
         return {
             'error': 'Script requires manual approval before execution',
             'level': 'requires_approval',
@@ -137,6 +225,7 @@ def execute(agent: dict, args: dict) -> dict:
             'reasons': safety['reasons'],
             'blocked_patterns': safety['blocked_patterns'],
             'approval_info': safety['approval_info'],
+            '_safety': _safety_prov,
         }
 
     if safety['level'] == 'warning':
@@ -150,64 +239,77 @@ def execute(agent: dict, args: dict) -> dict:
 
     env = args.get('env') or {}
     if not isinstance(env, dict):
-        return {'error': "'env' must be an object (dict) of string key-value pairs."}
+        return {'error': "'env' must be an object (dict) of string key-value pairs.",
+                '_safety': _safety_prov}
 
     # Auto-inject agent variables as environment variables (base layer).
     # LLM-specified env takes priority over agent variables.
-    agent_vars = (agent or {}).get('variables') or {}
-    if agent_vars:
-        base = {k: str(v) for k, v in agent_vars.items() if _VALID_ENV_KEY_RE.match(k)}
-        base.update(env)
-        env = base
+    env = {**build_agent_env(agent), **env}
 
     env, err = validate_env_keys(env)
     if err:
-        return {'error': err}
+        return {'error': err, '_safety': _safety_prov}
 
     # ------------------------------------------------------------------
     # Dispatch to active backend
     # ------------------------------------------------------------------
     backend = registry.get_backend(session_id, agent)
+    # SSH/Evonet backends run `bash -s`, which never sources ~/.profile or
+    # ~/.bashrc: resolve the host's real PATH once (see lib/shell_path.py).
+    env = ensure_path_env(agent, backend, env)
     result = backend.run_bash(script, timeout, env)
 
-    # Track background spawns (guard wrapper or manual tmux/screen/nohup) and
-    # start the completion watcher so the agent is notified when they finish.
+    # Best-effort lifecycle disposition for Decim telemetry (internal only).
+    _update_decim_disposition(_decim_event_id, result)
+
+    # Identify background spawns so the agent can attach a monitor to them.
+    # Registration is silent — nothing watches or notifies on its own.
     try:
-        _track_background_spawn(agent, session_id, script, result)
+        job = _track_background_spawn(session_id, script, result, agent)
+        if job:
+            result['background_job'] = {
+                'job_id': job.job_id,
+                'log_file': job.log_file,
+                'kind': job.kind,
+                'hint': ('Running unwatched. Call monitor(action="attach", '
+                         f'target={{"job_id": "{job.job_id}"}}, when={{...}}) '
+                         'if you need to be told when something happens.'),
+            }
     except Exception:
         pass  # Never let job tracking break command execution
+
+    # Provenance travels out-of-band: the LLM loop pops `_safety` before the
+    # result is serialized for the model or the user.
+    if isinstance(result, dict):
+        result['_safety'] = _safety_prov
     return result
 
 
-def _track_background_spawn(agent: dict, session_id: str, script: str,
-                            result: dict) -> None:
-    """Register a background spawn after successful execution and auto-watch it.
+def _track_background_spawn(session_id: str, script: str, result: dict,
+                            agent: Optional[dict] = None):
+    """Register a background spawn after successful execution.
 
     Handles both long_running_guard wrapper scripts (BYPASS_MARKER) and the
     agent's own tmux/screen/nohup spawns. Only fires when the spawning script
-    itself succeeded — a failed spawn has nothing to watch.
+    itself succeeded — a failed spawn has nothing to track. Returns the
+    BackgroundJob, or None when the script did not spawn anything.
     """
     if result.get('error') or result.get('exit_code', 0) != 0:
-        return
+        return None
 
     from backend.agent_runtime.background_jobs import (
-        parse_wrapper_script, parse_manual_spawn, background_jobs, auto_watch)
+        parse_wrapper_script, parse_manual_spawn, background_jobs,
+        snapshot_backend_ctx)
 
-    _wrap = parse_wrapper_script(script)
-    if _wrap:
-        job = background_jobs.register(session_id, **_wrap)
-    else:
-        _spawn = parse_manual_spawn(script)
-        if not _spawn:
-            return
-        job = background_jobs.register(session_id, **_spawn)
+    # Capture which sandbox this ran in so a monitor attached later polls the
+    # SAME one (its persisted schedule only has agent_id and would otherwise
+    # resolve — or recreate — a different sandbox).
+    backend_ctx = snapshot_backend_ctx(agent or {})
 
-    auto_watch(
-        job,
-        agent_id=(agent or {}).get('agent_id') or (agent or {}).get('id', ''),
-        external_user_id=(agent or {}).get('user_id'),
-        channel_id=(agent or {}).get('channel_id'),
-    )
+    _spawn = parse_wrapper_script(script) or parse_manual_spawn(script)
+    if not _spawn:
+        return None
+    return background_jobs.register(session_id, backend_ctx=backend_ctx, **_spawn)
 
 
 # ---------------------------------------------------------------------------

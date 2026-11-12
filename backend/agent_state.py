@@ -173,8 +173,9 @@ class AgentState:
     def __init__(self, mode: str = "plan", tasks: list = None, next_task_id: int = 1,
                  plan_file: str = None, states: dict = None,
                  focus: bool = False, focus_reason: str = None,
-                 auto_trivial: bool = False, atg: dict = None,
-                 cmp: dict = None, always_execute: bool = False):
+                 auto_trivial: bool = False,
+                 cmp: dict = None, always_execute: bool = False,
+                 active_goal: dict = None):
         self.mode = mode
         self.always_execute: bool = always_execute
         if self.always_execute:
@@ -192,13 +193,16 @@ class AgentState:
         # the runtime's _busy_agents flag is used instead.
         self.focus: bool = focus
         self.focus_reason: str | None = focus_reason
-        # ATG (Atomic Task Graph) state, set by backend.agent_runtime.atg when
-        # the enable_atg flag is on: {status, dag, history, repair_attempts, stats}
-        self.atg: dict | None = atg
         # CMP (Context Memory Path) session-path store, set by
         # backend.agent_runtime.cmp when enable_cmp is on:
         # {version, active_id, next_id, paths: {P1: {...card+segments+snapshot}}, stats}
         self.cmp: dict | None = cmp
+        # Active session goal set by the `/goal` command (see backend.active_goal).
+        # Stored structurally (id/title/summary/raw_instruction) and rendered into
+        # the Agent State system message, so a bounded title + operational summary
+        # is re-injected every turn and survives history filtering and summary
+        # compaction without leaking the raw slash-command literal.
+        self.active_goal: dict | None = active_goal
 
     # ── Blocking ────────────────────────────────────────────────────────────
 
@@ -422,42 +426,6 @@ class AgentState:
             })
         return transitions
 
-    def sync_completed_atg_tasks(self) -> list[int]:
-        """Mark unambiguously matched AgentState tasks complete from ATG results.
-
-        ATG node goals are independently generated and therefore must not seed
-        or broadly reconcile the user-owned task list. Only completed nodes
-        whose normalized goal has one exact match among existing incomplete
-        tasks are allowed to advance that task.
-        """
-        dag = self.atg.get("dag") if isinstance(self.atg, dict) else None
-        nodes = dag.get("nodes") if isinstance(dag, dict) else None
-        if not isinstance(nodes, dict):
-            return []
-
-        completed_goals = set()
-        for node in nodes.values():
-            if not isinstance(node, dict) or node.get("status") not in ("done", "frozen"):
-                continue
-            goal, _ = _sanitize_task_text(str(node.get("goal", "")))
-            if goal:
-                completed_goals.add(goal.casefold())
-
-        completed_task_ids = []
-        for goal in completed_goals:
-            matches = [
-                task for task in self.tasks
-                if task.get("status") != "done"
-                and task.get("text", "").casefold() == goal
-            ]
-            if len(matches) != 1:
-                continue
-            task = matches[0]
-            task["status"] = "done"
-            task.pop("in_progress_since", None)
-            completed_task_ids.append(task["id"])
-        return completed_task_ids
-
     def update_tasks(self, action: str, task_id: int = None,
                      text: str = None, tasks: list = None) -> dict:
         """
@@ -470,6 +438,8 @@ class AgentState:
             "in_progress" — Mark a task as the sole in_progress task (requires task_id).
                             Any other active task returns to pending.
             "replace"     — Update task text while preserving its ID and status.
+            "update"      — Patch specific tasks by ID (requires a 'tasks' list of
+                            {id, text?, status?}); unlisted tasks are untouched.
             "remove"      — Remove a task (requires task_id).
         """
         if action == "set":
@@ -497,20 +467,7 @@ class AgentState:
             task = self._find_task(task_id)
             if task is None:
                 return {"error": f"Task #{task_id} not found."}
-            if action == "in_progress":
-                # A serially executed batch may activate several IDs in turn.
-                # Make the latest transition authoritative and repair malformed
-                # legacy state deterministically without changing task order.
-                for other in self.tasks:
-                    if other is not task and other.get("status") == "in_progress":
-                        other["status"] = "pending"
-                task["status"] = "in_progress"
-                if "in_progress_since" not in task:
-                    task["in_progress_since"] = time.time()
-            else:
-                task["status"] = "done"
-                # Timestamp is only meaningful while the task is in progress.
-                task.pop("in_progress_since", None)
+            self._set_task_status(task, action)
             return {"result": f"Task #{task_id} marked as {task['status']}.", "tasks": self._task_summary()}
 
         if action == "replace":
@@ -523,6 +480,47 @@ class AgentState:
             task["text"] = clean
             return {"result": f"Task #{task_id} text replaced.", "tasks": self._task_summary()}
 
+        if action == "update":
+            if not isinstance(tasks, list) or not tasks:
+                return {"error": "Action 'update' requires a non-empty 'tasks' list of {id, text?, status?}."}
+            # Validate the whole batch before applying so a bad item never
+            # leaves the plan half-updated.
+            changes = []
+            seen_ids = set()
+            for item in tasks:
+                if not isinstance(item, dict) or item.get("id") is None:
+                    return {"error": "Each 'update' item must be an object with an 'id'."}
+                try:
+                    item_id = int(item["id"])
+                except (TypeError, ValueError):
+                    return {"error": f"Invalid task id {item['id']!r}."}
+                if item_id in seen_ids:
+                    return {"error": f"Task #{item_id} listed more than once."}
+                seen_ids.add(item_id)
+                task = self._find_task(item_id)
+                if task is None:
+                    return {"error": f"Task #{item_id} not found."}
+                clean = None
+                if item.get("text") is not None:
+                    clean, _ = _sanitize_task_text(str(item["text"]))
+                    if not clean:
+                        return {"error": f"Task #{item_id} text must not be empty."}
+                status = item.get("status")
+                if status is not None and status not in VALID_TASK_STATUSES:
+                    return {"error": f"Invalid status {status!r} for task #{item_id}."}
+                if clean is None and status is None:
+                    return {"error": f"Task #{item_id} update needs 'text' and/or 'status'."}
+                changes.append((task, clean, status))
+            if sum(1 for _, _, s in changes if s == "in_progress") > 1:
+                return {"error": "Only one task may be set to in_progress."}
+            for task, clean, status in changes:
+                if clean is not None:
+                    task["text"] = clean
+                if status is not None:
+                    self._set_task_status(task, status)
+            ids = ", ".join(f"#{t['id']}" for t, _, _ in changes)
+            return {"result": f"Updated tasks {ids}.", "tasks": self._task_summary()}
+
         if action == "remove":
             if task_id is None:
                 return {"error": "Action 'remove' requires 'task_id'."}
@@ -532,7 +530,23 @@ class AgentState:
                 return {"error": f"Task #{task_id} not found."}
             return {"result": f"Task #{task_id} removed.", "tasks": self._task_summary()}
 
-        return {"error": f"Unknown action '{action}'. Valid: set, add, done, in_progress, replace, remove"}
+        return {"error": f"Unknown action '{action}'. Valid: set, add, done, in_progress, replace, update, remove"}
+
+    def _set_task_status(self, task: dict, status: str) -> None:
+        if status == "in_progress":
+            # A serially executed batch may activate several IDs in turn.
+            # Make the latest transition authoritative and repair malformed
+            # legacy state deterministically without changing task order.
+            for other in self.tasks:
+                if other is not task and other.get("status") == "in_progress":
+                    other["status"] = "pending"
+            task["status"] = "in_progress"
+            if "in_progress_since" not in task:
+                task["in_progress_since"] = time.time()
+        else:
+            task["status"] = status
+            # Timestamp is only meaningful while the task is in progress.
+            task.pop("in_progress_since", None)
 
     def _find_task(self, task_id: int):
         for t in self.tasks:
@@ -588,36 +602,29 @@ class AgentState:
 
     # ── Rendering ────────────────────────────────────────────────────────────
 
-    def render(self, agent_id: str = None, atg_enabled: bool = False,
-               cmp_enabled: bool = False, agent_name: str = None) -> str:
+    def render(self, agent_id: str = None,
+               cmp_enabled: bool = False, agent_name: str = None,
+               update_tasks_available: bool = True) -> str:
         """Render state as a markdown system message for LLM injection.
 
         Args:
             agent_id: If provided, plan file path is resolved relative to
                       agents/<agent-id>/ (with fallback to project root for
                       backward compatibility with old centralized plans).
-            atg_enabled: When True, plan-mode instructions steer the agent to
-                      compile_task_graph() instead of a free-form save_plan().
             cmp_enabled: When True and cmp state exists, render the session
                       path map + cards section.
+            update_tasks_available: When False (e.g. the kanban skill
+                      suppresses builtin:update_tasks), omit any instruction
+                      to call update_tasks — never tell the model to use a
+                      tool it does not have.
         """
         if self.always_execute:
             mode_note = "execute — write tools are **allowed** (always_execute is on)"
         elif self.mode == "plan":
-            if atg_enabled:
-                mode_note = (
-                    "plan — write tools are **blocked** until user approves. "
-                    "After exploring, you MUST call compile_task_graph(goal, context) "
-                    "to compile this task into an executable task graph "
-                    "(it becomes your plan file) before set_mode('execute'). "
-                    "Only use save_plan() instead if the task truly cannot be "
-                    "expressed as tool steps."
-                )
-            else:
-                mode_note = (
-                    "plan — write tools are **blocked** until user approves. "
-                    "You MUST call save_plan() before set_mode('execute')."
-                )
+            mode_note = (
+                "plan — write tools are **blocked** until user approves. "
+                "You MUST call save_plan() before set_mode('execute')."
+            )
         else:
             mode_note = "execute — write tools are **allowed**"
 
@@ -636,6 +643,13 @@ class AgentState:
             reason_note = f" — {self.focus_reason}" if self.focus_reason else ""
             lines.append(f"**Focus**: active{reason_note} (messages from other sessions are rejected)")
 
+        if self.active_goal:
+            from backend.active_goal import render_active_goal_system_message
+            _goal_block = render_active_goal_system_message(self.active_goal)
+            if _goal_block:
+                lines.append("")
+                lines.append(_goal_block)
+
         plan_content = ""
         if self.plan_file:
             lines.append(f"**Plan file**: `{self.plan_file}`")
@@ -646,11 +660,6 @@ class AgentState:
                 lines.append(plan_content)
         elif not self.always_execute:
             lines.append("**Plan file**: _none — use save_plan(filename, content) to create one_")
-
-        if self.atg:
-            lines.append("")
-            lines.append("### Atomic Task Graph")
-            lines.append(self._render_atg_summary())
 
         if self.cmp and cmp_enabled:
             try:
@@ -668,6 +677,12 @@ class AgentState:
         if self.tasks:
             lines.append("")
             lines.append("### Task List")
+            if update_tasks_available:
+                lines.append(
+                    "_Keep this list current: mark tasks done with "
+                    "update_tasks before finishing any turn where you "
+                    "completed work._"
+                )
             for t in self.tasks:
                 icon = STATUS_ICON.get(t.get("status"), "[ ]")
                 text = t.get("text") or "(no description)"
@@ -694,7 +709,7 @@ class AgentState:
                     "3 minutes.** Consider whether stuck. If blocked, switch to another "
                     "task or mark this one done."
                 )
-        else:
+        elif update_tasks_available:
             lines.append("")
             lines.append("_No tasks defined yet. Use update_tasks(action='set', tasks=[...]) to define your plan._")
 
@@ -716,20 +731,6 @@ class AgentState:
                 lines.append(f"- {detail}")
 
         return "\n".join(lines)
-
-    def _render_atg_summary(self) -> str:
-        """Compact one-line ATG status (never the full graph JSON)."""
-        atg = self.atg or {}
-        status = atg.get("status", "unknown")
-        nodes = ((atg.get("dag") or {}).get("nodes") or {})
-        if not nodes:
-            return f"**Status**: {status}"
-        counts = {}
-        for nd in nodes.values():
-            s = nd.get("status", "pending")
-            counts[s] = counts.get(s, 0) + 1
-        counts_str = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-        return f"**Status**: {status} — {len(nodes)} nodes ({counts_str})"
 
     def _read_plan_file(self, agent_id: str = None, max_chars: int = _PLAN_FILE_MAX_CHARS) -> str:
         """Read plan file content from disk, capped at max_chars.
@@ -794,9 +795,9 @@ class AgentState:
             "focus": self.focus,
             "focus_reason": self.focus_reason,
             "auto_trivial": self.auto_trivial,
-            "atg": self.atg,
             "cmp": self.cmp,
             "always_execute": self.always_execute,
+            "active_goal": self.active_goal,
         })
 
     @classmethod
@@ -813,9 +814,9 @@ class AgentState:
                 focus=obj.get("focus", False),
                 focus_reason=obj.get("focus_reason"),
                 auto_trivial=obj.get("auto_trivial", False),
-                atg=obj.get("atg"),
                 cmp=obj.get("cmp"),
                 always_execute=obj.get("always_execute", False),
+                active_goal=obj.get("active_goal"),
             )
         except (json.JSONDecodeError, TypeError, AttributeError):
             return cls()

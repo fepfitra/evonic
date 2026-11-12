@@ -11,7 +11,7 @@ import threading
 import uuid
 import requests
 from typing import Dict, Any, Optional
-from backend.channels.base import BaseChannel, strip_system_tags
+from backend.channels.base import BaseChannel, strip_system_tags, unique_attachment_path
 from backend.channels.whatsapp_dispatcher import WhatsAppOutboundDispatcher
 
 _logger = logging.getLogger(__name__)
@@ -19,6 +19,71 @@ _logger = logging.getLogger(__name__)
 _bridge_logger = logging.getLogger('baileys')
 
 _BRIDGE_DIR = os.path.join(os.path.dirname(__file__), 'whatsapp-bridge')
+
+
+def _proc_info(pid: int):
+    """(ppid, command line) of a live process, or None. Uses ps so it works on Linux and macOS."""
+    try:
+        out = subprocess.run(['ps', '-p', str(int(pid)), '-o', 'ppid=,command='],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    parts = out.split(None, 1)
+    try:
+        return int(parts[0]), (parts[1] if len(parts) > 1 else '')
+    except ValueError:
+        return None
+
+
+def reap_orphan_bridge(session_dir: str, *, proc_info=_proc_info, kill=os.kill, sleep=time.sleep,
+                       own_pid: Optional[int] = None, timeout: float = 8.0) -> Optional[int]:
+    """Stop a WhatsApp bridge that is still running from a previous app instance.
+
+    The bridge holds an exclusive lock on its auth dir (``<auth dir>.owner/pid``). If the app is restarted without the bridge
+    being stopped (SIGKILL, crash, an older build), the orphan keeps the WhatsApp session connected but unmanaged, and every
+    new bridge refuses to start ("auth directory is already owned by bridge PID ...") until the app gives up. Only a process
+    that really is a whatsapp-bridge ``index.js`` and is not a child of this app is touched. Returns the reaped PID, if any.
+    """
+    import signal as _signal
+    own_pid = os.getpid() if own_pid is None else own_pid
+    try:
+        with open(os.path.abspath(session_dir) + '.owner/pid', 'r', encoding='utf-8') as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 1 or pid == own_pid:
+        return None
+    info = proc_info(pid)
+    if not info:
+        return None                       # already gone: the bridge clears the stale lock itself
+    ppid, cmd = info
+    if 'whatsapp-bridge' not in cmd or 'index.js' not in cmd:
+        return None                       # PID was reused by something unrelated
+    if ppid == own_pid:
+        return None                       # ours
+    _logger.warning("Found an orphaned WhatsApp bridge (PID %s) holding %s - stopping it before starting a new one", pid, session_dir)
+    try:
+        kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        return pid
+    except OSError as e:
+        _logger.error("Could not stop orphaned bridge %s: %s", pid, e)
+        return None
+    waited = 0.0
+    while waited < timeout:
+        if not proc_info(pid):
+            return pid
+        sleep(0.25)
+        waited += 0.25
+    try:
+        kill(pid, _signal.SIGKILL)
+    except OSError:
+        pass
+    sleep(0.5)
+    return pid
+
 
 
 def _whatsapp_format(text: str) -> str:
@@ -116,6 +181,124 @@ def _read_global_setting(key: str, default: str) -> str:
         return default
 
 
+def _is_status_broadcast(sender: str, jid: str) -> bool:
+    """Return whether an inbound payload represents a WhatsApp Status update."""
+    return sender in {"status", "status@broadcast"} or jid == "status@broadcast"
+
+
+def _is_non_conversational_broadcast(sender: str, jid: str) -> bool:
+    """Return whether an inbound payload is a Status or Channel broadcast."""
+    return _is_status_broadcast(sender, jid) or jid.endswith('@newsletter')
+
+
+def _sanitize_attachment_filename(name: str) -> str:
+    """Return a bounded path-safe filename for an inbound WhatsApp document."""
+    basename = os.path.basename(str(name or '').replace('\\', '/'))
+    cleaned = re.sub(r'[^A-Za-z0-9._-]', '_', basename)[:120]
+    return cleaned.strip('.') or 'document'
+
+
+def _decode_document_payload(document_data: Any,
+                             max_bytes: int = 10 * 1024 * 1024) -> Optional[Dict[str, Any]]:
+    """Validate and decode bounded bridge document data without trusting metadata."""
+    if not isinstance(document_data, dict):
+        return None
+    encoded = document_data.get('base64')
+    if not isinstance(encoded, str) or not encoded:
+        return None
+
+    # Reject oversized data before allocating the decoded byte buffer. Four
+    # base64 characters encode at most three bytes, with a small padding margin.
+    if len(encoded) > ((max_bytes + 2) // 3) * 4:
+        _logger.warning("WhatsApp document rejected before decode: payload exceeds %s bytes",
+                        max_bytes)
+        return None
+    try:
+        document_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        _logger.warning("WhatsApp document decode failed: %s", exc)
+        return None
+    if not document_bytes or len(document_bytes) > max_bytes:
+        return None
+
+    declared_length = document_data.get('file_length')
+    if declared_length is not None:
+        try:
+            if int(declared_length) != len(document_bytes):
+                _logger.warning(
+                    "WhatsApp document length mismatch: declared=%s actual=%s",
+                    declared_length, len(document_bytes))
+                return None
+        except (TypeError, ValueError):
+            return None
+
+    mime_type = re.sub(
+        r'[\x00-\x1f\x7f]', '',
+        str(document_data.get('mimetype') or 'application/octet-stream'),
+    )[:255] or 'application/octet-stream'
+    return {
+        'bytes': document_bytes,
+        'filename': _sanitize_attachment_filename(document_data.get('filename')),
+        'mime_type': mime_type,
+    }
+
+
+def _human_size(size_bytes: int) -> str:
+    """Format an attachment size for the agent-visible attachment marker."""
+    size = float(size_bytes)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024 or unit == 'GB':
+            return f'{int(size)} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+    return f'{size_bytes} B'
+
+
+def _format_attachment_marker(attachment_info: Dict[str, Any]) -> str:
+    """Build the standard agent-readable attachment marker."""
+    return (
+        f"[Attached: {attachment_info['original_filename']} "
+        f"({attachment_info['mime_type']}, {_human_size(attachment_info['size_bytes'])}) "
+        f"id={attachment_info['attachment_id']} path={attachment_info['file_path']}]"
+    )
+
+
+def _normalize_location_payload(location_data: Any) -> Optional[Dict[str, Any]]:
+    """Validate the bridge location payload and coerce numeric coordinates."""
+    if not isinstance(location_data, dict):
+        return None
+    try:
+        latitude = float(location_data.get('latitude'))
+        longitude = float(location_data.get('longitude'))
+    except (TypeError, ValueError):
+        _logger.warning("WhatsApp location payload has invalid coordinates: %r",
+                        location_data)
+        return None
+    if not (-90.0 <= latitude <= 90.0) or not (-180.0 <= longitude <= 180.0):
+        _logger.warning("WhatsApp location coordinates out of range: %s, %s",
+                        latitude, longitude)
+        return None
+    return {
+        'latitude': latitude,
+        'longitude': longitude,
+        'name': str(location_data.get('name') or '').strip(),
+        'address': str(location_data.get('address') or '').strip(),
+        'accuracy_in_meters': location_data.get('accuracy_in_meters'),
+        'is_live': bool(location_data.get('is_live')),
+    }
+
+
+def _format_location_text(location_data: Dict[str, Any]) -> str:
+    """Render a shared location as agent-readable text with a maps link."""
+    latitude = location_data['latitude']
+    longitude = location_data['longitude']
+    label = location_data.get('name') or location_data.get('address') or ''
+    kind = 'Live location' if location_data.get('is_live') else 'Location'
+    header = f'[{kind} shared]' + (f' {label}' if label else '')
+    return (f'{header}\n'
+            f'latitude={latitude}, longitude={longitude}\n'
+            f'https://www.google.com/maps?q={latitude},{longitude}')
+
+
 def _format_quoted_context(quoted_text=None, quoted_message=None,
                            quoted_is_bot=False, quoted_sender_name='',
                            quoted_sender='', is_group=False) -> str:
@@ -166,6 +349,15 @@ def _wrap_group_message(text, group_name, push_name, sender,
         lines.append(quote_context)
     lines.append(text)
     return '\n'.join(lines)
+
+
+def _reject_group_for_agent(agent, is_group: bool) -> bool:
+    """dm_only agents reject every group message before further processing.
+
+    The check is deliberately independent of @mentions, replies, and slash
+    commands: a dm_only agent must not engage with group chats at all.
+    """
+    return bool(is_group and agent and agent.get('dm_only'))
 
 
 class WhatsAppChannel(BaseChannel):
@@ -262,6 +454,9 @@ class WhatsAppChannel(BaseChannel):
             "- Prefer one complete combined answer over several fragmented messages.\n"
             "- Use plain text that renders reliably in WhatsApp. Avoid Markdown constructs "
             "such as heading markers, fenced code blocks, and Markdown links; use plain URLs.\n"
+            "- Images and files: ALWAYS deliver them with the `send_file` tool so they arrive "
+            "as attachments. NEVER embed images with HTML `<img>` tags or Markdown image "
+            "embeds (`![alt](url)`) — WhatsApp does not render them; they arrive as raw text.\n"
             "- Do not claim to be human. Be transparent that you are an AI assistant when "
             "identity is relevant.\n"
             "- Preserve useful structure with short paragraphs or simple numbered items "
@@ -276,18 +471,50 @@ class WhatsAppChannel(BaseChannel):
         message silently."""
         return self.agent_id
 
+    def _request_group_approval(self, group_id: str, group_name: str) -> None:
+        """Create a pending approval for an unapproved group (idempotent).
+
+        Unlike DMs, no pairing code is sent into the group — the admin
+        approves the group from the channel's Pending Approvals list. Once
+        approved, every group member can chat with the agent via @mention.
+        The pending entry lives 24h; each new group message recreates it
+        after expiry so it stays visible while the group is active.
+        """
+        from models.db import db
+        from datetime import datetime, timedelta
+        try:
+            existing = db.get_pending_approvals(self.channel_id)
+            if any(p.get('external_user_id') == group_id for p in existing):
+                return
+            expires_at = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+            db.create_pending_approval(
+                channel_id=self.channel_id,
+                external_user_id=group_id,
+                user_name=group_name or group_id,
+                pair_code=db._generate_pair_code(),
+                expires_at=expires_at,
+            )
+            _logger.info(
+                "WhatsApp group approval requested: group=%s name=%r channel=%s",
+                group_id, group_name, self.channel_id)
+        except Exception as e:
+            _logger.warning("Failed to create group pending approval: %s", e)
+
     def _gate_sender(self, sender: str, is_group: bool, jid: str, text: str,
                      push_name: str, payload: dict) -> bool:
         """Allowlist/pairing gate — returns True when the message should be
         processed. Groups are checked by group ID, DMs by individual user ID.
+        Unapproved groups raise a pending approval request (visible in the
+        channel modal) instead of being dropped silently.
         Subclasses may override (e.g. when a routing table is the allowlist)."""
         from models.db import db
         if is_group:
             group_id = jid.split('@')[0] if '@' in jid else jid
-            if not db.is_user_allowed(self.channel_id, group_id):
-                _logger.info("WhatsApp group not in allowlist: group=%s", group_id)
-                return False
-            return True
+            if db.is_user_allowed(self.channel_id, group_id):
+                return True
+            self._request_group_approval(group_id, (payload or {}).get('group_name') or '')
+            _logger.info("WhatsApp group not in allowlist (approval pending): group=%s", group_id)
+            return False
 
         user_name = push_name or payload.get('name') or sender
 
@@ -311,7 +538,7 @@ class WhatsAppChannel(BaseChannel):
             return True
 
         # Step 2: User NOT in allowlist — try pairing-code auto-approve
-        from backend.channels.pairing import extract_pair_code, format_pair_code as fmt_code
+        from backend.channels.pairing import extract_pair_code
         raw_code = extract_pair_code(text) if text else None
         if raw_code:
             _logger.info("WhatsApp pairing code received from %s (channel %s)", sender, self.channel_id)
@@ -329,28 +556,32 @@ class WhatsAppChannel(BaseChannel):
                         self._do_send(sender,
                             "✅ You're now approved! Welcome aboard. How can I help you today?")
                 return False
-            else:
+            # The code did not match a live pending approval. Never dead-end the
+            # sender: fall through so a pending approval is (re)created below and
+            # the admin can approve them from the channel's Pending Approvals.
+
+        # No live pairing code (or an unmatched one) — make sure the sender has a
+        # pending approval so they show up in the channel modal, then reply.
+        existing = db.get_pending_approvals(self.channel_id)
+        already_pending = any(
+            p.get('external_user_id') == sender for p in existing
+        )
+        if not already_pending:
+            allowed, pair_code = self._check_allowlist(sender, user_name)
+            if not allowed and pair_code:
                 self._do_send(sender,
-                    "❌ That pairing code is invalid or has expired. "
-                    "Please ask the administrator for a new one.")
-                return False
-        else:
-            # No pairing code in message — check if pending approval already exists
-            existing = db.get_pending_approvals(self.channel_id)
-            already_pending = any(
-                p.get('external_user_id') == sender for p in existing
-            )
-            if not already_pending:
-                allowed, pair_code = self._check_allowlist(sender, user_name)
-                if not allowed and pair_code:
-                    self._do_send(sender,
-                        "👋 You're not yet approved to chat here. "
-                        "Please ask the administrator for a pairing code, then send it in this chat.")
-                # If open mode, user IS allowed — would have been caught above
-            # If already pending, stay silent (don't spam the user)
-            _logger.info("WhatsApp DM from unapproved user %s (pending=%s, channel %s)",
-                         sender, already_pending, self.channel_id)
-            return False
+                    "👋 You're not yet approved to chat here. "
+                    "Please ask the administrator for a pairing code, then send it in this chat.")
+            # If open mode, user IS allowed — would have been caught above
+        elif raw_code:
+            # Already pending and the retried code no longer matches.
+            self._do_send(sender,
+                "❌ That pairing code is invalid or has expired. "
+                "Please ask the administrator for a new one.")
+        # If already pending (no code), stay silent (don't spam the user)
+        _logger.info("WhatsApp DM from unapproved user %s (pending=%s, code=%s, channel %s)",
+                     sender, already_pending, bool(raw_code), self.channel_id)
+        return False
 
     def start(self):
         # Register EventStream handlers first (before background bridge startup)
@@ -372,6 +603,14 @@ class WhatsAppChannel(BaseChannel):
             source_agent = data.get('source_agent_name')
             header = f"Approval Required (agent: {source_agent})" if source_agent else "Approval Required"
             text = f"{header}\nTool: {tool_name}\nRisk: {risk}\n{desc}"
+            # Include the focused snippet (window centered on the dangerous line with a
+            # marker) so mobile reviewers can actually see the risky code. WhatsApp
+            # interactive-button bodies are length-limited, so keep it compact.
+            focus_snippet = info.get('focus_snippet') or ''
+            if focus_snippet:
+                if len(focus_snippet) > 700:
+                    focus_snippet = focus_snippet[:700].rstrip() + '\n…'
+                text += f"\n\n```{focus_snippet}```"
             try:
                 self._bridge_post('/send-buttons', {
                     'to': self._jid_map.get(user_id, user_id),
@@ -490,6 +729,7 @@ class WhatsAppChannel(BaseChannel):
                 # an empty auth dir and force a spurious QR re-scan.
                 session_dir = os.path.join(APP_ROOT, 'data', 'whatsapp-sessions', self.channel_id)
                 os.makedirs(session_dir, exist_ok=True)
+                reap_orphan_bridge(session_dir)
 
                 callback_url = (
                     f"http://127.0.0.1:{EVONIC_PORT}"
@@ -663,7 +903,7 @@ class WhatsAppChannel(BaseChannel):
             parts = button_id.split(':', 1)
             if len(parts) == 2 and parts[0] in ('approve', 'reject'):
                 from backend.agent_runtime.approval import approval_registry
-                approval_registry.resolve(parts[1], parts[0])
+                approval_registry.resolve(parts[1], parts[0], resolved_by='user:whatsapp')
             return
 
         sender = payload.get('from', '')
@@ -675,6 +915,14 @@ class WhatsAppChannel(BaseChannel):
         group_name = payload.get('group_name') or ''
         quoted_sender = payload.get('quoted_sender') or ''
         quoted_sender_name = payload.get('quoted_sender_name') or ''
+
+        # WhatsApp Status updates and Channel newsletters are broadcasts, not
+        # direct user messages. Routing them can create synthetic conversations
+        # or capture newsletter IDs as unassigned shared-channel senders.
+        if _is_non_conversational_broadcast(sender, jid):
+            _logger.info("WhatsApp broadcast/newsletter dropped (channel %s)",
+                         self.channel_id)
+            return
 
         # Reply through the exact namespace used by the inbound conversation.
         # Baileys may also resolve the peer's alternate PN/LID identity; retain it
@@ -693,6 +941,8 @@ class WhatsAppChannel(BaseChannel):
         image_data = payload.get('image')
         audio_data = payload.get('audio')
         video_data = payload.get('video')
+        document_data = payload.get('document')
+        location_data = _normalize_location_payload(payload.get('location'))
         quoted_text = payload.get('quoted_text')
         quoted_message = payload.get('quoted_message')
         quoted_context = _format_quoted_context(
@@ -716,7 +966,7 @@ class WhatsAppChannel(BaseChannel):
             msg_type = 'document'
         elif payload.get('sticker'):
             msg_type = 'sticker'
-        elif payload.get('location'):
+        elif location_data:
             msg_type = 'location'
 
         # Resolve before emitting diagnostics so the listener can report the route
@@ -766,6 +1016,20 @@ class WhatsAppChannel(BaseChannel):
                          sender, is_group, jid)
             return
 
+        # dm_only agents reject every group message before any further processing,
+        # including @mentions, replies, and slash commands.
+        agent = db.get_agent(agent_id)
+        if _reject_group_for_agent(agent, is_group):
+            _logger.info("WhatsApp group message dropped (agent dm_only): agent=%s sender=%s text=%s",
+                         agent_id, sender, text[:80] if text else "")
+            return
+
+        # Allowlist check — groups use group ID, DMs use individual user ID.
+        # Runs before the mention gate so that any activity in an unapproved
+        # group surfaces a pending approval request in the channel modal.
+        if not self._gate_sender(sender, is_group, jid, text, push_name, payload):
+            return
+
         # In groups, only respond when @mentioned or when user replies to a bot message
         if is_group and not bot_mentioned and not quoted_is_bot:
             _logger.info("WhatsApp group message dropped (not mentioned): sender=%s text=%s", sender, text[:80] if text else "")
@@ -775,17 +1039,12 @@ class WhatsAppChannel(BaseChannel):
         if bot_mentioned and text:
             text = re.sub(r'@\d+', '', text).strip()
 
-        # Allowlist check — groups use group ID, DMs use individual user ID
-        if not self._gate_sender(sender, is_group, jid, text, push_name, payload):
-            return
-
         image_url = None
         video_url = None
         image_bytes = None  # decoded original bytes, persisted as attachment below
         audio_bytes = None  # decoded original bytes, persisted as attachment below
         audio_mime = None
-
-        agent = db.get_agent(agent_id)
+        document = _decode_document_payload(document_data)
 
         if image_data:
             try:
@@ -832,6 +1091,14 @@ class WhatsAppChannel(BaseChannel):
             elif not text:
                 text = '[Video]'
 
+        if document and not text:
+            text = '[Document]'
+        elif payload.get('document_download_failed') and not text:
+            text = '[Document download failed]'
+
+        if location_data and not text:
+            text = _format_location_text(location_data)
+
         if not text and not image_url and not video_url and not quoted_context:
             _logger.info("WhatsApp message dropped (no usable content): sender=%s", sender)
             return
@@ -865,9 +1132,7 @@ class WhatsAppChannel(BaseChannel):
 
         session_id = db.get_or_create_session(agent_id, session_user_id, self.channel_id)
 
-        # Persist the image to disk and build attachment_info — the in-memory
-        # data URL alone is invisible to the agent (images are never auto-fed
-        # to the LLM; the describe_image tool needs a file path on disk).
+        # Persist media to disk so attachment tools can access the original bytes.
         attachment_info = None
         if image_bytes:
             attachment_info = self._save_image_attachment(
@@ -877,11 +1142,36 @@ class WhatsAppChannel(BaseChannel):
             attachment_info = self._save_audio_attachment(
                 session_id, sender, audio_bytes, audio_mime or 'audio/ogg',
                 agent_id=agent_id)
+        elif document:
+            attachment_info = self._save_document_attachment(
+                session_id, sender, document['bytes'], document['mime_type'],
+                document['filename'], agent_id=agent_id)
+
+        # Append the standard marker only after persistence succeeds. This keeps
+        # paths and attachment IDs truthful and makes captionless PDFs usable.
+        if attachment_info and document:
+            marker = _format_attachment_marker(attachment_info)
+            final_text = f"{final_text}\n{marker}" if final_text else marker
 
         if not db.is_session_bot_enabled(session_id, agent_id=agent_id):
             _logger.info("WhatsApp message stored only — bot disabled for session %s (sender=%s)",
                          session_id, sender)
-            db.add_chat_message(session_id, 'user', text or '[Image]', agent_id=agent_id)
+            stored = final_text or text or '[Attachment]'
+            message_id = db.add_chat_message(
+                session_id, 'user', stored, agent_id=agent_id,
+            )
+            message_id = message_id if type(message_id) in (int, str) else None
+            from models.chatlog import chatlog_manager
+            chatlog_manager.get(agent_id, session_id).append({
+                'type': 'user', 'session_id': session_id, 'content': stored,
+                'sender_id': session_user_id, 'message_id': message_id,
+            })
+            from backend.event_stream import event_stream
+            event_stream.emit('message_received', {
+                'agent_id': agent_id, 'session_id': session_id,
+                'external_user_id': session_user_id, 'channel_id': self.channel_id,
+                'message': stored, 'message_id': message_id, 'role': 'user',
+            })
             return
 
         _logger.info("WhatsApp message received from %s (channel %s)", sender, self.channel_id)
@@ -945,10 +1235,9 @@ class WhatsAppChannel(BaseChannel):
                 'image/jpeg': '.jpg', 'image/png': '.png',
                 'image/webp': '.webp', 'image/gif': '.gif',
             }.get(mime_type, '.jpg')
-            filename = f"{int(time.time())}_whatsapp{ext}"
             target_dir = os.path.join('data', 'attachments', agent_id, session_id)
-            os.makedirs(target_dir, exist_ok=True)
-            file_path = os.path.join(target_dir, filename)
+            file_path = unique_attachment_path(target_dir, f"whatsapp{ext}")
+            filename = os.path.basename(file_path)
             with open(file_path, 'wb') as f:
                 f.write(image_bytes)
             attachment_id = db.save_attachment(
@@ -1006,10 +1295,9 @@ class WhatsAppChannel(BaseChannel):
                 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a',
                 'audio/wav': '.wav', 'audio/webm': '.webm',
             }.get(mime_type, '.ogg')
-            filename = f"{int(time.time())}_whatsapp_voice{ext}"
             target_dir = os.path.join('data', 'attachments', agent_id, session_id)
-            os.makedirs(target_dir, exist_ok=True)
-            file_path = os.path.join(target_dir, filename)
+            file_path = unique_attachment_path(target_dir, f"whatsapp_voice{ext}")
+            filename = os.path.basename(file_path)
             with open(file_path, 'wb') as f:
                 f.write(audio_bytes)
             attachment_id = db.save_attachment(
@@ -1038,6 +1326,63 @@ class WhatsAppChannel(BaseChannel):
             _logger.error("Failed to persist WhatsApp audio attachment: %s", e, exc_info=True)
             return None
 
+    def _save_document_attachment(self, session_id: str, external_user_id: str,
+                                  document_bytes: bytes, mime_type: str,
+                                  original_filename: str,
+                                  agent_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Persist a validated inbound WhatsApp document as an Evonic attachment."""
+        from models.db import db
+        agent_id = agent_id or self.agent_id
+        try:
+            cfg = db.get_agent_attachment_config(agent_id)
+            if not cfg.get('enabled'):
+                _logger.info("Skipping WhatsApp document for agent %s: attachments disabled",
+                             agent_id)
+                return None
+            max_bytes = cfg.get('max_size_mb', 10) * 1024 * 1024
+            if len(document_bytes) > max_bytes:
+                _logger.info(
+                    "Skipping WhatsApp document for agent %s: size %s exceeds %s bytes",
+                    agent_id, len(document_bytes), max_bytes)
+                return None
+
+            safe_name = _sanitize_attachment_filename(original_filename)
+            target_dir = os.path.join('data', 'attachments', agent_id, session_id)
+            file_path = unique_attachment_path(target_dir, safe_name)
+            filename = os.path.basename(file_path)
+            with open(file_path, 'wb') as handle:
+                handle.write(document_bytes)
+            attachment_id = db.save_attachment(
+                agent_id=agent_id,
+                session_id=session_id,
+                filename=filename,
+                file_path=file_path,
+                external_user_id=external_user_id,
+                channel_id=self.channel_id,
+                channel_type='whatsapp',
+                original_filename=safe_name,
+                mime_type=mime_type,
+                file_type='document',
+                size_bytes=len(document_bytes),
+            )
+            _logger.info("WhatsApp document saved as attachment %s (%d bytes): %s",
+                         attachment_id, len(document_bytes), file_path)
+            return {
+                'attachment_id': attachment_id,
+                'filename': filename,
+                'original_filename': safe_name,
+                'mime_type': mime_type,
+                'size_bytes': len(document_bytes),
+                # A document sent as a file may still be an image; the web chat
+                # keys its preview off this flag.
+                'is_image': mime_type.startswith('image/'),
+                'file_path': file_path,
+            }
+        except Exception as exc:
+            _logger.error("Failed to persist WhatsApp document attachment: %s",
+                          exc, exc_info=True)
+            return None
+
     def _clear_typing(self, external_user_id: str):
         """Cancel any pending typing debounce timer and suppress late
         llm_thinking events (dispatched async, they can outlive the turn)
@@ -1058,12 +1403,9 @@ class WhatsAppChannel(BaseChannel):
 
     def send_message_buffered(self, external_user_id: str, text: str,
                               session_id: str = None):
-        """Queue intermediate output without blocking runtime callback threads."""
-        if self._dispatcher:
-            self._dispatcher.enqueue(
-                external_user_id, text, session_id=session_id, is_final=False)
-            return
-        super().send_message_buffered(external_user_id, text, session_id=session_id)
+        """Suppress intermediate agent output; WhatsApp delivers final responses only."""
+        _logger.debug(
+            "Suppressing WhatsApp intermediate output for channel %s", self.channel_id)
 
     def send_message(self, external_user_id: str, text: str,
                      session_id: str = None):
@@ -1174,29 +1516,46 @@ class WhatsAppChannel(BaseChannel):
         if caption:
             caption = _whatsapp_format(caption)
 
-        # 5. Send via bridge
+        # 5. Submit through the bridge delivery lifecycle. A successful HTTP
+        # response means Baileys accepted the attachment; delivery is confirmed
+        # later through whatsapp_outbound_status callbacks.
+        correlation_id = uuid.uuid4().hex
         self._clear_typing(external_user_id)
         try:
-            self._bridge_post('/send-file', {
+            result = self._bridge_post('/send-file', {
                 'to': to,
                 'filePath': file_path,
                 'caption': caption,
                 'mimeType': mime_type,
+                'correlation_id': correlation_id,
             })
-            _logger.info("WhatsApp file sent to %s (channel %s): %s",
-                         external_user_id, self.channel_id, file_path)
+            status = result.get('status')
+            if status != 'accepted':
+                _logger.error(
+                    "WhatsApp file was not accepted for %s: status=%s correlation_id=%s",
+                    external_user_id, status, correlation_id)
+                return False
+            _logger.info(
+                "WhatsApp file accepted for %s (channel %s): correlation_id=%s "
+                "message_id=%s file=%s",
+                external_user_id, self.channel_id, correlation_id,
+                result.get('message_id'), file_path)
         except Exception as e:
             _logger.error("WhatsApp file send failed to %s: %s", external_user_id, e)
             return False
-        self.send_typing(external_user_id, state='paused')
+        finally:
+            self.send_typing(external_user_id, state='paused')
 
-        # 6. Emit event (consistent with _do_send)
+        # 6. Report queue acceptance without claiming confirmed delivery.
         from backend.event_stream import event_stream
         event_stream.emit('message_sent', {
             'channel_type': 'whatsapp',
             'channel_id': self.channel_id,
             'external_user_id': external_user_id,
             'message': f"[File: {os.path.basename(file_path)}]",
+            'status': 'accepted',
+            'correlation_id': correlation_id,
+            'message_id': result.get('message_id'),
         })
         return True
 

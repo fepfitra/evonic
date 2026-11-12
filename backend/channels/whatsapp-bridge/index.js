@@ -5,6 +5,9 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const { attachmentTransportReady, submitAttachment } = require('./attachment-message');
+const { downloadInboundDocument, extractInboundText } = require('./inbound-document');
+const { extractInboundLocation } = require('./inbound-location');
 const { extractQuotedMessage, unwrapMessage } = require('./quoted-message');
 const { normalizeRecipientJid } = require('./jid');
 const { OutboundLifecycle } = require('./outbound-lifecycle');
@@ -419,13 +422,8 @@ async function startBaileys() {
                 pushNameCache.set(sender, msg.pushName);
             }
 
-            // Extract text
-            const text =
-                content?.conversation ||
-                content?.extendedTextMessage?.text ||
-                content?.imageMessage?.caption ||
-                content?.videoMessage?.caption ||
-                '';
+            // Extract text, including document captions wrapped by WhatsApp.
+            const text = extractInboundText(content);
 
             // Extract button reply (approval flow)
             const buttonReply = content?.buttonsResponseMessage;
@@ -435,7 +433,8 @@ async function startBaileys() {
                 continue;
             }
 
-            // Extract image if present
+            // Extract media if present. Baileys performs the decryption before
+            // bytes are forwarded to the Python channel.
             let image = null;
             if (content?.imageMessage) {
                 try {
@@ -451,9 +450,28 @@ async function startBaileys() {
                 }
             }
 
-            // Log every inbound message (early feature — verbose for monitoring)
-            console.log('[whatsapp-bridge] MSG id=%s from=%s jid=%s group=%s text_len=%d image=%s',
-                messageId, sender, jid, isGroup, text.length, !!image);
+            let document = null;
+            let documentDownloadFailed = false;
+            if (content?.documentMessage) {
+                try {
+                    document = await downloadInboundDocument({
+                        message: msg, content, downloadMediaMessage, logger,
+                    });
+                } catch (e) {
+                    documentDownloadFailed = true;
+                    console.error('[whatsapp-bridge] Failed to download document:', e.message);
+                }
+            }
+
+            // Extract shared location (static or live). Coordinates are metadata,
+            // so no media download is required.
+            const location = extractInboundLocation(content);
+
+            // Log every inbound message without logging attachment contents.
+            console.log('[whatsapp-bridge] MSG id=%s from=%s jid=%s group=%s text_len=%d image=%s document=%s document_download_failed=%s location=%s',
+                messageId, sender, jid, isGroup, text.length, !!image, !!document,
+                documentDownloadFailed,
+                location ? `${location.latitude},${location.longitude}${location.is_live ? ' (live)' : ''}` : '-');
             if (isGroup) {
                 console.log('[whatsapp-bridge] GROUP MSG keys:', JSON.stringify(Object.keys(msg.message || {})),
                     'unwrapped:', JSON.stringify(Object.keys(content || {})));
@@ -507,7 +525,8 @@ async function startBaileys() {
             const groupName = isGroup ? await getGroupSubject(jid) : null;
 
             postCallback({
-                from: sender, jid, message_id: messageId, text, image,
+                from: sender, jid, message_id: messageId, text, image, document, location,
+                document_download_failed: documentDownloadFailed,
                 message_timestamp: messageTimestamp,
                 content_type: contentType,
                 wrapper_types: wrapperTypes,
@@ -648,25 +667,41 @@ app.post('/typing', async (req, res) => {
 });
 
 app.post('/send-file', async (req, res) => {
-    const { to, filePath, caption, mimeType } = req.body || {};
+    const {
+        to, filePath, caption, mimeType,
+        correlation_id: requestedCorrelationId, session_id: sessionId,
+    } = req.body || {};
     if (!to || !filePath) {
         return res.status(400).json({ error: 'to and filePath required' });
     }
-    if (!sock || connectionStatus !== 'connected') {
-        return res.status(503).json({ error: 'Not connected to WhatsApp' });
+    if (!attachmentTransportReady({
+        hasSocket: Boolean(sock), connectionStatus, messageSendReady,
+    })) {
+        return res.status(503).json({ error: 'WhatsApp message transport is not ready' });
     }
     const jid = normalizeRecipientJid(to);
+    const correlationId = requestedCorrelationId
+        || `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    console.log(
+        '[whatsapp-bridge] SEND FILE requested correlationId=%s to=%s jid=%s fileName=%s',
+        correlationId, to, jid, path.basename(filePath));
     try {
-        const fileBuffer = fs.readFileSync(filePath);
-        await sock.sendMessage(jid, {
-            document: fileBuffer,
-            mimetype: mimeType || 'application/octet-stream',
-            fileName: path.basename(filePath),
-            caption: caption || undefined,
+        const result = await submitAttachment({
+            lifecycle: outboundLifecycle,
+            correlationId,
+            jid,
+            fileBuffer: fs.readFileSync(filePath),
+            filePath,
+            caption,
+            mimeType,
+            sessionId,
         });
-        res.json({ success: true });
+        res.status(result.httpStatus).json(result.body);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        console.error(
+            '[whatsapp-bridge] SEND FILE FAIL correlationId=%s to=%s error=%s',
+            correlationId, jid, e.message);
+        res.status(500).json({ error: e.message, correlation_id: correlationId });
     }
 });
 

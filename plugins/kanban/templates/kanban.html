@@ -2,6 +2,38 @@
 {% block content %}
 
 <style>
+/* Create/edit task popup: content-sized, scrollable body, pinned footer, responsive two-column form. */
+.kb-task-modal { max-height: calc(100dvh - 2rem); overflow: hidden; }
+.kb-task-form { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; padding: 0 !important; }
+.kb-task-fields { min-height: 0; flex: 1 1 auto; overflow-y: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 1.125rem 1.25rem; padding: 1.25rem 1.5rem; }
+.kb-task-fields > div { min-width: 0; margin: 0 !important; }
+.kb-task-fields > div:last-child, .kb-task-fields > div.kb-task-wide { grid-column: 1 / -1; }
+.kb-task-fields label.kb-field-label, .kb-task-fields .kb-field-label { display: block; margin-bottom: 0.375rem; font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.01em; }
+.kb-task-fields input[type="text"], .kb-task-fields select, .kb-task-fields textarea { border-radius: 0.625rem; transition: border-color .15s ease, box-shadow .15s ease; }
+.kb-task-fields input[type="text"], .kb-task-fields select { height: 2.5rem; padding-top: 0 !important; padding-bottom: 0 !important; }
+.kb-task-fields select { appearance: none; -webkit-appearance: none; padding-right: 2.25rem !important; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%239ca3af' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 8l5 5 5-5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 0.75rem center; background-size: 1rem; }
+.kb-task-fields textarea { min-height: 7rem; line-height: 1.5; }
+.kb-task-files-field { margin-bottom: 0 !important; }
+.kb-task-footer { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 0.5rem; padding: 0.875rem 1.5rem; border-top: 1px solid #e5e7eb; background: rgba(249, 250, 251, 0.8); }
+html.dark .kb-task-footer { border-top-color: #374151; background: rgba(17, 24, 39, 0.35); }
+.kb-enhance-btn { display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.75rem; font-weight: 600; line-height: 1; padding: 0.375rem 0.625rem; border-radius: 9999px; color: #4f46e5; background: #eef2ff; border: 1px solid #c7d2fe; transition: background-color .15s ease, border-color .15s ease; }
+.kb-enhance-btn:hover { background: #e0e7ff; border-color: #a5b4fc; }
+html.dark .kb-enhance-btn { color: #a5b4fc; background: rgba(79, 70, 229, 0.15); border-color: rgba(129, 140, 248, 0.35); }
+html.dark .kb-enhance-btn:hover { background: rgba(79, 70, 229, 0.28); }
+@media (max-width: 640px) {
+    .kb-task-modal { max-height: calc(100dvh - 1.5rem); }
+    .kb-task-fields { grid-template-columns: minmax(0, 1fr); padding: 1rem; gap: 1rem; }
+    .kb-task-fields > div:last-child { grid-column: auto; }
+    .kb-task-fields > div.kb-task-wide { grid-column: 1; }
+    .kb-task-footer { padding: 0.75rem 1rem; }
+}
+
+/* Clickable elements always show a pointer cursor */
+button:not(:disabled), [role="button"], summary, select, #kb-modal select, #kb-modal label[for], #kb-detail-modal label[for], #kb-modal [onclick], #kb-detail-modal [onclick], #task-deps-dropdown li, .kb-tab { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+
 /* Markdown rendering in comments */
 .kb-markdown > :first-child { margin-top: 0; }
 .kb-markdown > :last-child { margin-bottom: 0; }
@@ -93,6 +125,243 @@ html.dark .skeleton-card {
 .skeleton-card .sk-actions { display: flex; gap: 0.25rem; margin-top: 0.25rem; border-top: 1px solid #f3f4f6; padding-top: 0.5rem; }
 html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
 .skeleton-card .sk-btn { height: 1.5rem; border-radius: 0.25rem; flex: 1; }
+/* Task title flash: the title TEXT turns solid yellow, then slowly shades
+   back to its original color. A new tool call snaps it back to yellow. */
+@keyframes kb-flash-fade {
+    from { color: var(--kb-flash); }
+    to   { color: var(--kb-orig); }
+}
+.kb-task-title {
+    /* Original title colors: text-gray-800 (light) / text-gray-100 (dark). */
+    --kb-orig: #1f2937;
+    --kb-flash: #eab308;
+    border-radius: 0.25rem;
+    padding: 0 0.15rem;
+    margin: 0 -0.15rem;
+}
+html.dark .kb-task-title {
+    --kb-orig: #f3f4f6;
+    --kb-flash: #fde047;
+}
+.kb-task-title.kb-flash {
+    animation: kb-flash-fade var(--kb-decay, 1s) linear forwards;
+    animation-delay: var(--kb-seek, 0ms);
+}
+@media (prefers-reduced-motion: reduce) {
+    .kb-task-title.kb-flash { animation: none; color: var(--kb-flash); }
+}
+    /* ── Image attachment UI (task form + task detail modal) ─────────────
+       Self-contained styles: the interactive variants used here are not part
+       of the pre-built Tailwind bundle, so they are declared explicitly. */
+    .kb-dropzone {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        cursor: pointer;
+        border: 1px dashed #d1d5db;
+        border-radius: 0.5rem;
+        background: #f9fafb;
+        padding: 0.625rem 0.75rem;
+        transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    html.dark .kb-dropzone { border-color: #4b5563; background: rgba(55, 65, 81, 0.4); }
+    .kb-dropzone:hover, .kb-dropzone:focus-within { border-color: #818cf8; background: #eef2ff; }
+    html.dark .kb-dropzone:hover, html.dark .kb-dropzone:focus-within { border-color: #818cf8; background: rgba(49, 46, 129, 0.25); }
+    .kb-dropzone:focus-within { box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.45); }
+    .kb-dropzone-lg {
+        min-height: 0;
+        flex-direction: column;
+        justify-content: center;
+        gap: 0;
+        text-align: center;
+        padding: 1.125rem 1rem;
+        border-width: 1.5px;
+        border-radius: 0.75rem;
+    }
+    .kb-dropzone-over, html.dark .kb-dropzone-over { border-style: solid; border-color: #6366f1; background: rgba(99, 102, 241, 0.12); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2); }
+    .kb-dropzone-over .kb-dropzone-icon { background: #6366f1; border-color: #6366f1; color: #fff; transform: translateY(-2px); }
+    .kb-dropzone-icon {
+        display: flex;
+        flex: none;
+        height: 2rem;
+        width: 2rem;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.5rem;
+        background: #fff;
+        color: #4f46e5;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+        transition: transform 0.15s ease, background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+    html.dark .kb-dropzone-icon { border-color: #4b5563; background: #1f2937; color: #818cf8; }
+    .kb-dropzone-lg .kb-dropzone-icon { height: 2.25rem; width: 2.25rem; margin-bottom: 0.625rem; border-radius: 0.625rem; }
+    .kb-dropzone:hover .kb-dropzone-icon, .kb-dropzone:focus-within .kb-dropzone-icon {
+        background: #4f46e5;
+        border-color: #4f46e5;
+        color: #fff;
+        transform: scale(1.05);
+    }
+    html.dark .kb-dropzone:hover .kb-dropzone-icon, html.dark .kb-dropzone:focus-within .kb-dropzone-icon {
+        background: #6366f1;
+        border-color: #6366f1;
+        color: #fff;
+    }
+    .kb-dropzone-title { display: block; font-size: 0.75rem; font-weight: 500; color: #374151; }
+    html.dark .kb-dropzone-title { color: #e5e7eb; }
+    .kb-dropzone-lg .kb-dropzone-title { font-size: 0.875rem; line-height: 1.25rem; }
+    .kb-dropzone-accent { color: #4f46e5; }
+    html.dark .kb-dropzone-accent { color: #818cf8; }
+    .kb-dropzone-hint { display: block; font-size: 11px; color: #9ca3af; }
+    html.dark .kb-dropzone-hint { color: #9ca3af; }
+    .kb-dropzone-lg .kb-dropzone-hint { margin-top: 0.125rem; }
+    .kb-file-count {
+        flex: none;
+        border-radius: 9999px;
+        background: #e0e7ff;
+        color: #4338ca;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 0.125rem 0.5rem;
+        white-space: nowrap;
+    }
+    html.dark .kb-file-count { background: rgba(49, 46, 129, 0.4); color: #a5b4fc; }
+    .kb-file-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+    }
+    @media (min-width: 640px) { .kb-file-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .kb-file-card {
+        position: relative;
+        overflow: hidden;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.5rem;
+        background: #f9fafb;
+    }
+    html.dark .kb-file-card { border-color: #4b5563; background: rgba(55, 65, 81, 0.5); }
+    .kb-file-thumb { display: block; height: 5rem; width: 100%; background: #f3f4f6; }
+    html.dark .kb-file-thumb { background: #1f2937; }
+    .kb-file-thumb img { display: block; height: 100%; width: 100%; object-fit: cover; }
+    .kb-file-thumb-empty {
+        display: flex;
+        height: 100%;
+        width: 100%;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.25rem;
+        color: #9ca3af;
+    }
+    .kb-file-meta { display: block; padding: 0.375rem 0.5rem; }
+    .kb-file-name {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.75rem;
+        color: #374151;
+    }
+    html.dark .kb-file-name { color: #d1d5db; }
+    .kb-file-size { display: block; font-size: 11px; color: #9ca3af; }
+    .kb-file-remove {
+        position: absolute;
+        top: 0.25rem;
+        right: 0.25rem;
+        display: flex;
+        height: 1.5rem;
+        width: 1.5rem;
+        align-items: center;
+        justify-content: center;
+        border-radius: 9999px;
+        background: rgba(0, 0, 0, 0.55);
+        color: #fff;
+        font-size: 0.75rem;
+        line-height: 1;
+        opacity: 0;
+        transition: opacity 0.15s ease, background-color 0.15s ease;
+    }
+    .kb-file-card:hover .kb-file-remove, .kb-file-remove:focus-visible { opacity: 1; }
+    .kb-file-remove:hover { background: #dc2626; }
+    /* Touch devices never get a hover state: always show the remove action. */
+    @media (hover: none) { .kb-file-remove { opacity: 1; } }
+    .kb-progress-track { height: 0.375rem; width: 100%; overflow: hidden; border-radius: 9999px; background: #e5e7eb; }
+    html.dark .kb-progress-track { background: #374151; }
+    .kb-progress-fill { height: 100%; width: 0; border-radius: 9999px; background: #4f46e5; transition: width 0.15s ease-out; }
+    html.dark .kb-progress-fill { background: #6366f1; }
+/* Board / Table segmented switch */
+@media (min-width: 768px) { .kb-toolbar-actions { align-self: stretch; } }
+.kb-view-switch { flex: none; align-self: flex-start; position: relative; display: inline-grid; grid-template-columns: 1fr 1fr; align-items: stretch; padding: 3px; border-radius: 0.625rem; background: #e5e7eb; border: 1px solid #d1d5db; }
+html.dark .kb-view-switch { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.1); }
+.kb-view-thumb { position: absolute; top: 3px; bottom: 3px; left: 3px; width: calc(50% - 3px); border-radius: 0.45rem; background: #4f46e5; box-shadow: 0 1px 2px rgba(0,0,0,.25), 0 4px 10px -2px rgba(79,70,229,.45); transition: transform .22s cubic-bezier(.4,0,.2,1); }
+.kb-view-switch[data-active="table"] .kb-view-thumb { transform: translateX(100%); }
+.kb-view-switch .kb-view-opt { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem; padding: 0.3125rem 0.875rem; font-size: 0.875rem; font-weight: 500; line-height: 1.25rem; color: #4b5563; background: transparent; border: 0; border-radius: 0.45rem; transition: color .18s ease; }
+html.dark .kb-view-switch .kb-view-opt { color: #9ca3af; }
+.kb-view-switch .kb-view-opt:hover { color: #111827; }
+html.dark .kb-view-switch .kb-view-opt:hover { color: #e5e7eb; }
+.kb-view-switch .kb-view-opt[aria-selected="true"], html.dark .kb-view-switch .kb-view-opt[aria-selected="true"], .kb-view-switch .kb-view-opt[aria-selected="true"]:hover { color: #fff; }
+.kb-view-opt:focus-visible { outline: 2px solid #818cf8; outline-offset: 1px; }
+@media (max-width: 640px) { .kb-view-switch .kb-view-opt span { display: none; } .kb-view-switch .kb-view-opt { padding: 0.375rem 0.75rem; } }
+@media (prefers-reduced-motion: reduce) { .kb-view-thumb { transition: none; } }
+/* Row selection (click / Shift / drag) */
+.kb-table tr.kb-row:hover { background: rgba(107, 114, 128, 0.08); }
+.kb-table tr.kb-row-selected, .kb-table tr.kb-row-selected:hover { background: rgba(99, 102, 241, 0.16); }
+.kb-cb-cell { cursor: pointer; user-select: none; -webkit-user-select: none; width: 2.25rem; }
+.kb-cb-cell .kb-cb { cursor: pointer; }
+body.kb-select-dragging, body.kb-select-dragging * { user-select: none !important; -webkit-user-select: none !important; cursor: row-resize !important; }
+/* Selection discoverability: tip, grip, drag preview, pointer chip */
+.kb-tip { display: flex; align-items: center; gap: 0.625rem; margin-bottom: 0.75rem; padding: 0.5rem 0.5rem 0.5rem 0.875rem; border-radius: 0.625rem; font-size: 0.8125rem; line-height: 1.25rem; color: #3730a3; background: #eef2ff; border: 1px solid #c7d2fe; animation: kb-tip-in .25s ease-out; }
+.kb-tip[hidden] { display: none; }
+html.dark .kb-tip { color: #c7d2fe; background: rgba(99, 102, 241, 0.12); border-color: rgba(129, 140, 248, 0.3); }
+.kb-summary-wrap { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.kb-tip-link { font-size: 0.75rem; color: #6366f1; text-decoration: underline dotted; text-underline-offset: 3px; }
+.kb-tip-link:hover { color: #4f46e5; text-decoration-style: solid; }
+html.dark .kb-tip-link { color: #a5b4fc; }
+.kb-tip-icon { flex: none; opacity: .85; }
+.kb-tip-text { flex: 1 1 auto; min-width: 0; }
+.kb-tip kbd { display: inline-block; padding: 0 0.375rem; margin: 0 0.1rem; font: 600 0.75rem/1.2rem ui-monospace, SFMono-Regular, Menlo, monospace; color: inherit; background: rgba(255,255,255,.75); border: 1px solid #a5b4fc; border-bottom-width: 2px; border-radius: 0.3rem; }
+html.dark .kb-tip kbd { background: rgba(255,255,255,.08); border-color: rgba(165,180,252,.45); }
+.kb-tip-drag { font-weight: 600; text-decoration: underline dotted; text-underline-offset: 3px; }
+.kb-tip-close { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 1.75rem; height: 1.75rem; border-radius: 0.4rem; color: inherit; opacity: .7; transition: opacity .15s ease, background-color .15s ease; }
+.kb-tip-close:hover { opacity: 1; background: rgba(99, 102, 241, 0.18); }
+@keyframes kb-tip-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@media (max-width: 640px) { .kb-tip-drag, .kb-tip kbd { display: none; } }
+.kb-table tr.kb-row-selected .kb-cb-cell { box-shadow: inset 3px 0 0 #6366f1; }
+/* "N selected" card: height grows open, the card slides + fades in, and the reverse on the way out */
+.kb-bulk-wrap { display: grid; grid-template-rows: 0fr; opacity: 0; visibility: hidden; transition: grid-template-rows .3s cubic-bezier(.4, 0, .2, 1), opacity .2s ease, visibility 0s linear .3s; }
+.kb-bulk-wrap.is-open { grid-template-rows: 1fr; opacity: 1; visibility: visible; transition: grid-template-rows .3s cubic-bezier(.4, 0, .2, 1), opacity .25s ease .05s, visibility 0s; }
+.kb-bulk-inner { min-height: 0; overflow: hidden; }
+.kb-bulk-inner > #bulk-bar { margin-bottom: 0.75rem; transform: translateY(-10px) scale(.985); transform-origin: top center; transition: transform .3s cubic-bezier(.2, .8, .2, 1); }
+.kb-bulk-wrap.is-open .kb-bulk-inner > #bulk-bar { transform: none; }
+.kb-table tr.kb-row { transition: background-color .15s ease; }
+@media (prefers-reduced-motion: reduce) { .kb-bulk-wrap, .kb-bulk-wrap.is-open, .kb-bulk-inner > #bulk-bar, .kb-table tr.kb-row { transition: none; } }
+/* live preview of the range being dragged */
+.kb-table tr.kb-row-drag, .kb-table tr.kb-row-drag:hover { background: rgba(99, 102, 241, 0.3); }
+.kb-table tr.kb-row-drag-off, .kb-table tr.kb-row-drag-off:hover { background: rgba(239, 68, 68, 0.18); }
+.kb-drag-chip { position: fixed; z-index: 80; pointer-events: none; padding: 0.25rem 0.625rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; color: #fff; background: #4f46e5; box-shadow: 0 4px 14px rgba(79, 70, 229, 0.45); white-space: nowrap; }
+.kb-drag-chip[hidden] { display: none; }
+.kb-drag-chip.kb-chip-off { background: #dc2626; box-shadow: 0 4px 14px rgba(220, 38, 38, 0.4); }
+@media (prefers-reduced-motion: reduce) { .kb-tip { animation: none; } }
+/* Table pagination */
+.kb-table-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 0.5rem; min-height: 2.25rem; }
+.kb-pager { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.kb-pager-size { display: inline-flex; align-items: center; gap: 0.5rem; }
+.kb-pager-size .ev-cb { flex: none; }
+.kb-pager-nav { display: inline-flex; align-items: center; gap: 0.5rem; }
+.kb-pager-info { min-width: 6.5rem; text-align: center; font-size: 0.8125rem; color: #6b7280; font-variant-numeric: tabular-nums; }
+html.dark .kb-pager-info { color: #9ca3af; }
+.kb-pager-btn { display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: 0.5rem; border: 1px solid #d1d5db; color: #374151; background: #fff; transition: background-color .15s ease, opacity .15s ease; }
+html.dark .kb-pager-btn { border-color: rgba(255,255,255,.12); color: #e5e7eb; background: rgba(255,255,255,.05); }
+.kb-pager-btn:hover:not(:disabled) { background: #eef2ff; }
+html.dark .kb-pager-btn:hover:not(:disabled) { background: rgba(99,102,241,.25); }
+.kb-pager-btn:disabled { opacity: .4; }
+/* Table view: layout rules kept here because the compiled Tailwind build does not ship every utility. */
+.kb-table-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0.5rem; margin-bottom: 0.75rem; }
+.kb-table-filters .kb-reset-btn { white-space: nowrap; }
+.kb-table { width: 100%; border-collapse: collapse; }
+.kb-table th, .kb-table td { vertical-align: middle; }
+.kb-table td.kb-title-cell { max-width: 28rem; width: 100%; }
+.kb-table td.kb-title-cell a { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 </style>
 
 <!-- Board header -->
@@ -100,9 +369,10 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     <div class="flex items-center justify-between gap-2 sm:gap-3">
         <h1 class="text-lg sm:text-xl font-semibold text-gray-900 flex-shrink-0">Kanban Board</h1>
         <div class="flex items-center gap-1 sm:gap-1.5">
-          <button id="notifier-toggle" onclick="toggleNotifier()" class="shrink-0 px-2 py-1.5 sm:px-3 sm:py-2 text-xs sm:text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 flex items-center gap-1 sm:gap-1.5 transition relative group" title="Pause agent notifications">
+          <button id="notifier-toggle" onclick="toggleNotifier()" class="shrink-0 px-2 py-1.5 sm:px-3 sm:py-2 text-xs sm:text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 flex items-center gap-1 sm:gap-1.5 transition relative group" title="Pause agent notifications" aria-pressed="false" aria-label="Pause agent notifications">
             <svg class="w-3.5 h-3.5 sm:w-4 sm:h-4 notifier-pause-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
             <svg id="notifier-play-icon" class="w-3.5 h-3.5 sm:w-4 sm:h-4 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            <span id="notifier-toggle-label">Running</span>
           </button>
           <button id="auto-refresh-toggle" onclick="toggleAutoRefresh()" class="shrink-0 px-2 py-1.5 sm:px-3 sm:py-2 text-xs sm:text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 flex items-center gap-1 sm:gap-1.5 transition relative group" title="Auto-refresh board every 5 seconds">
             <svg class="w-3.5 h-3.5 sm:w-4 sm:h-4 refresh-icon transition-transform duration-1000 ease-in-out group-hover:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
@@ -110,6 +380,18 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         </div>
     </div>
     <div class="flex flex-col md:flex-row gap-2 items-center mt-3">
+        <!-- View switch (left corner) -->
+<div class="kb-view-switch" id="view-switch" role="tablist" aria-label="View mode" data-active="board">
+                <span class="kb-view-thumb" aria-hidden="true"></span>
+                <button type="button" id="view-btn-board" role="tab" aria-selected="true" onclick="setViewMode('board')" class="kb-view-opt">
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="5" height="18" rx="1.5"/><rect x="10" y="3" width="5" height="11" rx="1.5"/><rect x="17" y="3" width="4" height="15" rx="1.5"/></svg>
+                    <span>Board</span>
+                </button>
+                <button type="button" id="view-btn-table" role="tab" aria-selected="false" onclick="setViewMode('table')" class="kb-view-opt">
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 10h18M3 15h18M9 10v10"/></svg>
+                    <span>Table</span>
+                </button>
+            </div>
         <!-- Desktop search bar (left of buttons) -->
         <div class="hidden md:flex gap-2 items-center">
             <input type="text" id="search-input-desktop" placeholder="Search tasks..." class="w-64 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400" onkeydown="if(event.key==='Enter')applySearch()" oninput="syncSearch(this)">
@@ -117,11 +399,11 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         </div>
 
         <!-- Buttons group -->
-        <div class="flex gap-2 md:ml-auto">
+        <div class="kb-toolbar-actions flex gap-2 md:ml-auto">
             <button id="assign-btn" onclick="openAssignModal()" class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 bg-gray-300 dark:bg-gray-600 transition">Assign Agents</button>
             <button id="trigger-btn" onclick="triggerAgents()" class="px-4 py-2 text-sm font-medium text-white bg-orange-600 rounded-lg hover:bg-orange-700 transition">Trigger Agents</button>
 
-<button onclick="openCreateModal()" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition">+ Add Task</button>
+            <button onclick="openCreateModal()" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition">+ Add Task</button>
         </div>
 
         <!-- Mobile search bar (below buttons, full width) -->
@@ -133,7 +415,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
 </div>
 
 <!-- Board columns -->
-<div class="flex gap-4 px-6 pb-6 overflow-x-auto" style="min-height: calc(100vh - 140px);">
+<div id="board-view" class="flex gap-4 px-6 pb-6 overflow-x-auto" style="min-height: calc(100vh - 140px);">
     <div class="flex-1 min-w-[280px] dark:bg-gray-800 bg-gray-200 rounded-xl p-4 flex flex-col border border-gray-500" data-status="todo">
         <div class="flex items-center gap-2 mb-3">
             <span class="font-semibold text-gray-700 dark:text-gray-200">Todo</span>
@@ -193,6 +475,98 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     </div>
 </div>
 
+<!-- Table view -->
+<div id="table-view" class="hidden px-6 pb-6" style="min-height: calc(100vh - 140px);">
+    <div class="kb-table-filters">
+        <select id="tf-status" onchange="onTableFilterChange()" class="w-full px-2.5 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500">
+            <option value="active">Status: Active (no archived)</option>
+            <option value="all">Status: All</option>
+            <option value="todo">Todo</option>
+            <option value="in-progress">In Progress</option>
+            <option value="done">Done</option>
+            <option value="archived">Archived</option>
+        </select>
+        <select id="tf-priority" onchange="onTableFilterChange()" class="w-full px-2.5 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500">
+            <option value="">Priority: All</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+        </select>
+        <select id="tf-assignee" onchange="onTableFilterChange()" class="w-full px-2.5 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500"></select>
+        <select id="tf-deps" onchange="onTableFilterChange()" class="w-full px-2.5 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500">
+            <option value="">Dependencies: Any</option>
+            <option value="blocked">Blocked (deps unmet)</option>
+            <option value="ready">No unmet deps</option>
+        </select>
+        <button type="button" onclick="resetTableFilters()" class="kb-reset-btn px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-200 bg-gray-200 dark:bg-gray-600 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition">Reset filters</button>
+    </div>
+    <div id="select-tip" class="kb-tip" role="note" hidden>
+        <svg class="kb-tip-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l7.07 17 2.51-7.39L21 11.07z"/></svg>
+        <span class="kb-tip-text"><strong>Select many at once:</strong> <kbd>Shift</kbd>+click for a range, <span class="kb-tip-drag">drag across the checkboxes to toggle rows</span>, or <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+click to add one.</span>
+        <button type="button" class="kb-tip-close" onclick="dismissSelectTip()" aria-label="Dismiss tip" title="Dismiss">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+    </div>
+    <div id="bulk-wrap" class="kb-bulk-wrap">
+    <div class="kb-bulk-inner">
+    <div id="bulk-bar" class="flex items-center flex-wrap gap-2 px-3 py-2 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-700">
+        <span class="text-sm font-medium text-indigo-700 dark:text-indigo-300"><span id="bulk-count">0</span> selected<span id="bulk-offpage" class="font-normal text-indigo-500 dark:text-indigo-400"></span></span>
+        <select id="bulk-status" onchange="bulkSelectAction(this, 'status')" class="px-2 py-1 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+            <option value="">Move to…</option>
+            <option value="todo">Todo</option>
+            <option value="in-progress">In Progress</option>
+            <option value="done">Done</option>
+        </select>
+        <select id="bulk-priority" onchange="bulkSelectAction(this, 'priority')" class="px-2 py-1 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+            <option value="">Priority…</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+        </select>
+        <select id="bulk-assignee" onchange="bulkSelectAction(this, 'assignee')" class="px-2 py-1 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"></select>
+        <button type="button" onclick="bulkArchive(true)" class="px-3 py-1 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-600 transition">Archive</button>
+        <button type="button" onclick="bulkArchive(false)" class="px-3 py-1 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-600 transition">Unarchive</button>
+        <button type="button" onclick="bulkDelete()" class="px-3 py-1 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 transition">Delete</button>
+        <button type="button" onclick="clearSelection()" class="ml-auto text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 underline">Clear selection</button>
+    </div>
+    </div>
+    </div>
+    <div class="overflow-x-auto rounded-xl border border-gray-300 dark:border-gray-600">
+        <table class="kb-table text-sm">
+            <thead class="bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300">
+                <tr id="table-head"></tr>
+            </thead>
+            <tbody id="table-body" class="divide-y divide-gray-200 dark:divide-gray-700 bg-white dark:bg-gray-800"></tbody>
+        </table>
+    </div>
+    <div class="kb-table-footer">
+        <div class="kb-summary-wrap">
+            <div id="table-summary" class="text-xs text-gray-500 dark:text-gray-400"></div>
+            <button type="button" class="kb-tip-link" onclick="showSelectTip()" title="Shift+click, Ctrl/⌘+click and drag to select several rows">Selection tips</button>
+        </div>
+        <div class="kb-pager">
+            <label class="kb-pager-size text-xs text-gray-500 dark:text-gray-400">
+                <span>Rows per page</span>
+                <select id="page-size" onchange="setPageSize(this.value)" class="px-2 py-1 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="10">10</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                </select>
+            </label>
+            <div class="kb-pager-nav">
+                <button type="button" id="page-prev" onclick="gotoPage(tablePage - 1)" class="kb-pager-btn" aria-label="Previous page">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                </button>
+                <span id="page-indicator" class="kb-pager-info"></span>
+                <button type="button" id="page-next" onclick="gotoPage(tablePage + 1)" class="kb-pager-btn" aria-label="Next page">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Error state banner (hidden initially, shown on fetch failure) -->
 <div id="kanban-error-banner" class="kanban-error-state mx-6 mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl items-center justify-between gap-3">
     <div class="flex items-center gap-3">
@@ -203,41 +577,43 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
 </div>
 
 <!-- Create/Edit Modal -->
-<div class="fixed inset-0 bg-black/50 z-50 hidden items-center justify-center" id="kb-modal">
-    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md mx-4 p-6">
-        <h2 class="text-lg font-semibold mb-4 text-gray-900 dark:text-gray-100" id="modal-title">Add Task</h2>
-        <form id="task-form" onsubmit="handleSubmit(event)">
+<div class="fixed inset-0 bg-black/50 z-50 hidden items-center justify-center p-3 sm:p-5" id="kb-modal">
+    <div class="kb-task-modal bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-3xl mx-2 sm:mx-4 flex flex-col border-t-4 border-indigo-500 dark:border-indigo-400">
+        <div class="w-full px-5 sm:px-6 pt-5 pb-4 flex items-center justify-between gap-3 flex-shrink-0 border-b border-gray-200 dark:border-gray-700"><h2 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="modal-title">Add Task</h2><button type="button" onclick="closeModal()" aria-label="Close task form" title="Close" class="p-1 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"><svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 6l12 12M18 6L6 18"></path></svg></button></div>
+        <form id="task-form" class="kb-task-form" onsubmit="handleSubmit(event)">
             <input type="hidden" id="task-id">
+            <div class="kb-task-fields">
             <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="task-title">Title *</label>
+                <label class="kb-field-label text-gray-700 dark:text-gray-300" for="task-title">Title *</label>
                 <input class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" type="text" id="task-title" required placeholder="Enter task title">
             </div>
             <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="task-desc">Description</label>
-                <textarea class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm resize-y bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" id="task-desc" rows="3" placeholder="Enter task description"></textarea>
-                <button type="button" onclick="enhanceDescription()" id="enhance-btn" class="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg px-3 py-1.5 transition" title="Use AI to enhance description & generate title">
+                <label class="kb-field-label text-gray-700 dark:text-gray-300" for="task-assignee">Assign to Agent (optional)</label>
+                <select class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" id="task-assignee">
+                    <option value="">-- None --</option>
+                </select>
+                <div id="task-assignee-warning" class="hidden mt-1.5 text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700 rounded-lg px-3 py-2">This agent does not have the 'kanban' skill yet. To add this skill, go to Agent &gt; Settings &gt; Skills.</div>
+            </div>
+            <div class="mb-4 kb-task-wide">
+                <div class="flex items-center justify-between gap-3" style="margin-bottom:0.375rem"><label class="kb-field-label text-gray-700 dark:text-gray-300" style="margin:0" for="task-desc">Description</label>
+                <button type="button" onclick="enhanceDescription()" id="enhance-btn" class="kb-enhance-btn" title="Use AI to enhance description & generate title">
                     <svg class="w-3.5 h-3.5 enhance-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143z"></path></svg>
                     <span class="enhance-label">Enhance</span>
                     <svg class="w-3.5 h-3.5 enhance-spinner hidden animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
-                </button>
+                </button></div>
+                <textarea class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm resize-y bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" id="task-desc" rows="3" placeholder="Enter task description"></textarea>
+                
             </div>
             <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="task-priority">Priority</label>
+                <label class="kb-field-label text-gray-700 dark:text-gray-300" for="task-priority">Priority</label>
                 <select class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" id="task-priority">
                     <option value="low" selected>Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
                 </select>
             </div>
-            <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="task-assignee">Assign to Agent (optional)</label>
-                <select class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500" id="task-assignee">
-                    <option value="">-- None --</option>
-                </select>
-                <div id="task-assignee-warning" class="hidden mt-1.5 text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700 rounded-lg px-3 py-2">This agent does not have the 'kanban' skill yet. To add this skill, go to Agent &gt; Settings &gt; Skills.</div>
-            </div>
             <div class="mb-5">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Depends on (optional)</label>
+                <label class="kb-field-label text-gray-700 dark:text-gray-300">Depends on (optional)</label>
                 <div class="relative">
                     <input type="text" id="task-deps-search" autocomplete="off" placeholder="Search tasks…"
                         class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500">
@@ -245,27 +621,30 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                 </div>
                 <ul id="task-deps-selected" class="mt-2 flex flex-col gap-1"></ul>
             </div>
-            <div class="mb-5">
+            <div class="mb-5 kb-task-files-field">
                 <div class="flex items-center justify-between gap-3 mb-1.5">
-                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300" for="task-files">Attachments</label>
-                    <span class="text-xs text-gray-400 dark:text-gray-500">Optional</span>
+                    <label class="kb-field-label text-gray-700 dark:text-gray-300" style="margin:0" for="task-files">Attachments</label>
+                    <span class="flex items-center gap-2">
+                        <span id="task-files-count" class="hidden rounded-full bg-indigo-100 px-2 py-0.5 text-[11px] font-semibold text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300" aria-live="polite"></span>
+                        <span class="text-xs text-gray-400 dark:text-gray-500">Optional</span>
+                    </span>
                 </div>
                 <input type="file" id="task-files" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp,image/png,image/jpeg,image/gif,image/webp,image/bmp" multiple
                     class="sr-only"
                     onchange="handleFilesSelected(this)">
-                <label for="task-files" id="task-files-dropzone" class="group flex min-h-[116px] cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 px-4 py-4 text-center transition hover:border-indigo-400 hover:bg-indigo-50/60 focus-within:border-indigo-500 focus-within:bg-indigo-50/60 focus-within:ring-2 focus-within:ring-indigo-200 dark:border-gray-600 dark:bg-gray-700/40 dark:hover:border-indigo-400 dark:hover:bg-indigo-900/20 dark:focus-within:border-indigo-400 dark:focus-within:bg-indigo-900/20 dark:focus-within:ring-indigo-800"
+                <label for="task-files" id="task-files-dropzone" class="kb-dropzone kb-dropzone-lg"
                     ondragenter="handleTaskFilesDrag(event, true)" ondragover="handleTaskFilesDrag(event, true)" ondragleave="handleTaskFilesDrag(event, false)" ondrop="handleTaskFilesDrop(event)">
-                    <span class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-white text-indigo-600 shadow-sm ring-1 ring-gray-200 transition group-hover:scale-105 group-hover:bg-indigo-600 group-hover:text-white dark:bg-gray-800 dark:text-indigo-400 dark:ring-gray-600 dark:group-hover:bg-indigo-500 dark:group-hover:text-white">
+                    <span class="kb-dropzone-icon">
                         <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" x2="12" y1="3" y2="15"></line></svg>
                     </span>
-                    <span class="text-sm font-medium text-gray-700 dark:text-gray-200"><span class="text-indigo-600 dark:text-indigo-400">Choose images</span> or drag them here</span>
-                    <span class="mt-1 text-xs text-gray-400 dark:text-gray-500">PNG, JPG, GIF, WEBP, or BMP up to 10 MB each</span>
+                    <span class="kb-dropzone-title"><span class="kb-dropzone-accent">Choose images</span> or drag them here</span>
+                    <span class="kb-dropzone-hint">PNG, JPG, GIF, WEBP, or BMP up to 10 MB each</span>
                 </label>
-                <div id="task-files-error" class="hidden mt-1.5 text-xs text-red-600 dark:text-red-400"></div>
-                <ul id="task-files-list" class="mt-2 grid grid-cols-1 gap-1.5"></ul>
+                <div id="task-files-error" class="hidden mt-1.5 text-xs text-red-600 dark:text-red-400" role="alert" aria-live="polite"></div>
+                <ul id="task-files-list" class="kb-file-grid"></ul>
             </div>
-            <div class="flex justify-end gap-2">
-                <button type="button" class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition" onclick="closeModal()">Cancel</button>
+            </div>
+            <div class="kb-task-footer">
                 <button type="submit" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 dark:bg-indigo-500 rounded-lg hover:bg-indigo-700 dark:hover:bg-indigo-600 transition" id="modal-submit">Create Task</button>
             </div>
         </form>
@@ -349,10 +728,32 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                     <textarea id="comment-input" rows="3" placeholder="Add a comment..."
                         class="w-full border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-2 text-sm resize-y bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-500 focus:border-indigo-400 dark:focus:border-indigo-500"></textarea>
                     <div class="mt-2">
-                        <label for="comment-files" class="text-xs font-medium text-gray-500 dark:text-gray-400">Attach images</label>
                         <input type="file" id="comment-files" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp,image/png,image/jpeg,image/gif,image/webp,image/bmp" multiple
-                            class="block w-full mt-1 text-xs text-gray-600 dark:text-gray-300 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-indigo-50 file:text-indigo-600 dark:file:bg-indigo-900/30 dark:file:text-indigo-300">
-                        <div id="comment-files-list" class="mt-1 text-xs text-gray-500 dark:text-gray-400"></div>
+                            class="sr-only" aria-label="Attach images to comment"
+                            onchange="handleCommentFilesSelected(this)">
+                        <label for="comment-files" id="comment-files-dropzone" title="Attach images to this comment"
+                            class="kb-dropzone"
+                            ondragenter="handleCommentFilesDrag(event, true)" ondragover="handleCommentFilesDrag(event, true)" ondragleave="handleCommentFilesDrag(event, false)" ondrop="handleCommentFilesDrop(event)">
+                            <span class="kb-dropzone-icon">
+                                <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                            </span>
+                            <span class="min-w-0 flex-1">
+                                <span class="kb-dropzone-title"><span class="kb-dropzone-accent">Attach images</span> <span class="hidden sm:inline">or drag &amp; drop</span></span>
+                                <span class="kb-dropzone-hint hidden truncate sm:block">PNG, JPG, GIF, WEBP or BMP &middot; up to 10 MB each</span>
+                            </span>
+                            <span id="comment-files-count" class="kb-file-count hidden" aria-live="polite"></span>
+                        </label>
+                        <div id="comment-files-error" class="hidden mt-1.5 text-xs text-red-600 dark:text-red-400" role="alert" aria-live="polite"></div>
+                        <div id="comment-upload-progress" class="hidden mt-2">
+                            <div class="mb-1 flex items-center justify-between text-[11px] font-medium text-gray-500 dark:text-gray-400">
+                                <span id="comment-upload-progress-label">Uploading images&hellip;</span>
+                                <span id="comment-upload-progress-pct">0%</span>
+                            </div>
+                            <div id="comment-upload-progress-bar" class="kb-progress-track" role="progressbar" aria-label="Attachment upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                                <div id="comment-upload-progress-fill" class="kb-progress-fill"></div>
+                            </div>
+                        </div>
+                        <ul id="comment-files-list" class="kb-file-grid"></ul>
                     </div>
                     <div class="flex justify-end mt-2">
                         <button id="comment-submit-btn" onclick="submitComment()" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 dark:bg-indigo-500 rounded-lg hover:bg-indigo-700 dark:hover:bg-indigo-600 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
@@ -403,13 +804,37 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                         <ul id="detail-deps-selected" class="mt-2 flex flex-col gap-1"></ul>
                     </div>
                     <div class="mb-5">
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Attachments (optional)</label>
+                        <div class="mb-1.5 flex items-center justify-between gap-3">
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300" for="detail-task-files">Attachments</label>
+                            <span class="text-xs text-gray-400 dark:text-gray-500">Optional</span>
+                        </div>
                         <div id="detail-existing-attachments" class="flex flex-col gap-1 mb-2"></div>
                         <input type="file" id="detail-task-files" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp,image/png,image/jpeg,image/gif,image/webp,image/bmp" multiple
-                            class="w-full text-sm text-gray-700 dark:text-gray-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-600 hover:file:bg-indigo-100 dark:file:bg-indigo-900/30 dark:file:text-indigo-400 transition"
+                            class="sr-only" aria-label="Add attachments to this task"
                             onchange="handleDetailFilesSelected(this)">
-                        <div id="detail-task-files-error" class="hidden mt-1.5 text-xs text-red-600 dark:text-red-400"></div>
-                        <ul id="detail-task-files-list" class="mt-2 flex flex-col gap-1"></ul>
+                        <label for="detail-task-files" id="detail-task-files-dropzone" title="Add attachments to this task"
+                            class="kb-dropzone"
+                            ondragenter="handleDetailFilesDrag(event, true)" ondragover="handleDetailFilesDrag(event, true)" ondragleave="handleDetailFilesDrag(event, false)" ondrop="handleDetailFilesDrop(event)">
+                            <span class="kb-dropzone-icon">
+                                <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                            </span>
+                            <span class="min-w-0 flex-1">
+                                <span class="kb-dropzone-title"><span class="kb-dropzone-accent">Add images</span> <span class="hidden sm:inline">or drag &amp; drop</span></span>
+                                <span class="kb-dropzone-hint hidden truncate sm:block">PNG, JPG, GIF, WEBP or BMP &middot; up to 10 MB each</span>
+                            </span>
+                            <span id="detail-task-files-count" class="kb-file-count hidden" aria-live="polite"></span>
+                        </label>
+                        <div id="detail-task-files-error" class="hidden mt-1.5 text-xs text-red-600 dark:text-red-400" role="alert" aria-live="polite"></div>
+                        <div id="detail-task-upload-progress" class="hidden mt-2">
+                            <div class="mb-1 flex items-center justify-between text-[11px] font-medium text-gray-500 dark:text-gray-400">
+                                <span id="detail-task-upload-progress-label">Uploading&hellip;</span>
+                                <span id="detail-task-upload-progress-pct">0%</span>
+                            </div>
+                            <div id="detail-task-upload-progress-bar" class="kb-progress-track" role="progressbar" aria-label="Attachment upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                                <div id="detail-task-upload-progress-fill" class="kb-progress-fill"></div>
+                            </div>
+                        </div>
+                        <ul id="detail-task-files-list" class="kb-file-grid"></ul>
                     </div>
                     <div class="flex justify-end gap-2">
                         <button type="button" class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition" onclick="cancelEditFromDetail()">Cancel</button>
@@ -499,6 +924,8 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
 <script>
     const API = '/api/kanban';
     const SUPER_AGENT_ID = '{{ super_agent_id }}';
+    const TASK_FLASH_ENABLED = {{ 'true' if task_flash_enabled|default(true) else 'false' }};
+    const TASK_FLASH_DECAY_MS = {{ task_flash_decay_seconds|default(1) }} * 1000;
     let tasks = [];
     let currentDetailId = null;
     let _isEditing = false;  // true when editing existing task — prevents backdrop-click-close
@@ -727,6 +1154,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
 
         // Check for auto-archive (done tasks > 3 days without archived_at)
         checkAutoArchive();
+        if (viewMode === 'table') renderTable();
     }
 
     function fmtDate(dateStr) {
@@ -745,10 +1173,19 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         const hasAvatar = hasAgentAvatar(task.assignee);
         const nUrl = task.assignee ? `/api/agents/${esc(task.assignee)}/avatar` : '';
         const agentTitle = task.assignee ? esc(getAgentName(task.assignee)) : '';
+        // Avatar background mirrors the sidebar agent list: the shared
+        // deterministic color for regular agents, while the super agent keeps
+        // its red badge as a deliberate, distinct indicator.
+        const avatarIsSuper = task.assignee === SUPER_AGENT_ID;
+        const avatarStyle = (hasAssignee && !avatarIsSuper)
+            ? ` style="background-color:${avatarBgColor(task.assignee)}"` : '';
+        const avatarFallbackCls = avatarIsSuper
+            ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400'
+            : 'text-white';
         const rocketBtn = task.status === 'todo' ? `<button class="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 dark:bg-orange-900/40 text-orange-600 dark:text-orange-400 hover:bg-orange-200 dark:hover:bg-orange-900/50 transition" title="Trigger agent" onclick="handleTrigger(${task.id}, ${hasAssignee}, event)">🚀</button>` : '';
         return `
         <div class="bg-white dark:bg-gray-700 rounded-lg p-3 shadow-sm hover:shadow-md dark:shadow-gray-900/30 transition border border-gray-200 dark:border-gray-700 cursor-grab active:cursor-grabbing" data-id="${task.id}" draggable="true" ondragstart="handleDragStart(event)" ondragend="handleDragEnd(event)">
-            <div class="text-xs font-semibold text-gray-800 dark:text-gray-100 mb-1 break-words cursor-pointer" onclick="openDetailModal(${task.id})"><span class="text-gray-500 dark:text-gray-400 font-semibold">#${task.id} &bull;</span> ${esc(decodeHtmlEntities(task.title))}</div>
+            <div class="kb-task-title text-xs font-semibold text-gray-800 dark:text-gray-100 mb-1 break-words cursor-pointer" data-task-id="${task.id}" onclick="openDetailModal(${task.id})"><span class="kb-task-title-prefix text-gray-500 dark:text-gray-400 font-semibold">#${task.id} &bull;</span> ${esc(decodeHtmlEntities(task.title))}</div>
             ${task.description ? `<div class="text-[11px] text-gray-500 dark:text-gray-400 mb-2 line-clamp-2 break-words cursor-pointer" onclick="openDetailModal(${task.id})">${esc(decodeHtmlEntities(stripMarkdown(task.description)))}</div>` : ''}
             ${(task.deps && task.deps.length > 0 && !task.deps_met) ? `<div class="text-[10px] text-amber-600 dark:text-amber-400 mb-1.5 flex items-center gap-1">&#128274; blocked by ${task.deps.map(d => '#' + d).join(', ')}</div>` : ''}
             <div class="flex items-center gap-1.5 mb-1.5 flex-wrap">
@@ -756,8 +1193,8 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                 ${rocketBtn}
                 ${(task.status === 'in-progress' || (task.status === 'done' && task.started_at)) ? `<span class="flex items-center gap-1 text-[10px] text-indigo-500 dark:text-indigo-400 mx-auto"><svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>${fmtDuration(task)}</span>` : ''}
                 ${task.assignee ? (hasAvatar
-                    ? `<span class="ml-auto inline-flex items-center gap-0"><img src="${nUrl}" alt="" class="w-5 h-5 rounded-full object-cover" title="${agentTitle}" onerror="this.onerror=null;this.style.display='none';this.nextElementSibling.style.display='inline-flex'"><span class="hidden items-center justify-center w-5 h-5 rounded-full text-[9px] font-semibold ${task.assignee === SUPER_AGENT_ID ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400' : 'bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300'}" title="${agentTitle}">${initials}</span></span>`
-                    : `<span class="ml-auto inline-flex items-center justify-center w-5 h-5 rounded-full text-[9px] font-semibold ${task.assignee === SUPER_AGENT_ID ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400' : 'bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300'}" title="${agentTitle}">${initials}</span>`
+                    ? `<span class="ml-auto inline-flex items-center gap-0"><img src="${nUrl}" alt="" class="w-5 h-5 rounded-full object-cover" title="${agentTitle}" onerror="this.onerror=null;this.style.display='none';this.nextElementSibling.style.display='inline-flex'"><span class="hidden items-center justify-center w-5 h-5 rounded-full text-[9px] font-semibold ${avatarFallbackCls}"${avatarStyle} title="${agentTitle}">${initials}</span></span>`
+                    : `<span class="ml-auto inline-flex items-center justify-center w-5 h-5 rounded-full text-[9px] font-semibold ${avatarFallbackCls}"${avatarStyle} title="${agentTitle}">${initials}</span>`
                 ) : ''}
             </div>
             <div class="flex gap-1 pt-1.5 border-t border-gray-100 dark:border-gray-700 flex-wrap">
@@ -1019,6 +1456,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     // ---- Attachments (create/edit form) ----
     let _pendingFiles = [];
     let _pendingDetailFiles = [];
+    let _pendingCommentFiles = [];
     const _ALLOWED_IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
     const _MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
@@ -1032,42 +1470,74 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         return null;
     }
 
-    function _fileThumbHtml(f) {
-        if (f.preview) {
-            return `<img src="${f.preview}" class="w-8 h-8 object-cover rounded border border-gray-200 dark:border-gray-600 flex-shrink-0">`;
-        }
-        return '<span class="w-8 h-8 rounded bg-gray-100 dark:bg-gray-700 flex-shrink-0 flex items-center justify-center text-gray-400">\uD83D\uDCC4</span>';
+    // ---- Attachments: shared helpers ----
+
+    function _formatFileSize(bytes) {
+        const n = Number(bytes);
+        if (!isFinite(n) || n < 0) return '';
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10 * 1024 ? 1 : 0) + ' KB';
+        return (n / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
-    function _renderPendingFiles(listId, errorId, arr, removeFn) {
-        const $list = $(`#${listId}`);
-        const $err = $(`#${errorId}`);
-        $err.addClass('hidden').text('');
-        if (!arr.length) {
-            $list.html('<li class="text-xs text-gray-400 dark:text-gray-500">No files selected.</li>');
-            return;
-        }
-        $list.html(arr.map(function(f, i) {
-            return `<li class="flex items-center gap-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg px-2 py-1.5">
-                ${_fileThumbHtml(f)}
-                <span class="text-xs text-gray-700 dark:text-gray-300 truncate flex-1" title="${esc(f.name)}">${esc(f.name)}</span>
-                <button type="button" class="text-gray-400 hover:text-red-500 text-sm leading-none flex-shrink-0" title="Remove" onclick="${removeFn}(${i})">&times;</button>
-            </li>`;
-        }).join(''));
+    function _escAttr(text) {
+        return esc(text).replace(/"/g, '&quot;');
+    }
+
+    // Compact, theme-matched thumbnail card used by every list of files queued
+    // for upload (create/edit task form, detail edit panel, comment composer).
+    function _pendingFileCard(f, index, removeFn) {
+        const name = f.name || 'image';
+        const safeName = _escAttr(name);
+        const thumb = f.preview
+            ? '<img src="' + _escAttr(f.preview) + '" alt="" draggable="false">'
+            : '<span class="kb-file-thumb-empty" aria-hidden="true">&#128196;</span>';
+        return '<li class="kb-file-card">'
+            + '<span class="kb-file-thumb">' + thumb + '</span>'
+            + '<span class="kb-file-meta">'
+            + '<span class="kb-file-name" title="' + safeName + '">' + esc(name) + '</span>'
+            + '<span class="kb-file-size">' + esc(_formatFileSize(f.size)) + '</span>'
+            + '</span>'
+            + '<button type="button" class="kb-file-remove" onclick="' + removeFn + '(' + index + ')"'
+            + ' title="Remove ' + safeName + '" aria-label="Remove ' + safeName + '">&times;</button>'
+            + '</li>';
+    }
+
+    function _setPendingCount(countId, count) {
+        if (!countId) return;
+        const $badge = $('#' + countId);
+        if (!$badge.length) return;
+        $badge.text(count + (count === 1 ? ' file' : ' files')).toggleClass('hidden', count === 0);
+    }
+
+    function _renderPendingFiles(listId, errorId, arr, removeFn, countId) {
+        const $list = $('#' + listId);
+        $list.empty();
+        if (errorId) $('#' + errorId).addClass('hidden').text('');
+        _setPendingCount(countId, arr.length);
+        if (!arr.length) return;
+        $list.html(arr.map(function(f, i) { return _pendingFileCard(f, i, removeFn); }).join(''));
     }
 
     function _removePendingFile(index) {
         const f = _pendingFiles[index];
         if (f && f.preview) URL.revokeObjectURL(f.preview);
         _pendingFiles.splice(index, 1);
-        _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile');
+        _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count');
     }
 
     function _removePendingDetailFile(index) {
         const f = _pendingDetailFiles[index];
         if (f && f.preview) URL.revokeObjectURL(f.preview);
         _pendingDetailFiles.splice(index, 1);
-        _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile');
+        _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile', 'detail-task-files-count');
+    }
+
+    function _removePendingCommentFile(index) {
+        const f = _pendingCommentFiles[index];
+        if (f && f.preview) URL.revokeObjectURL(f.preview);
+        _pendingCommentFiles.splice(index, 1);
+        _renderPendingFiles('comment-files-list', 'comment-files-error', _pendingCommentFiles, '_removePendingCommentFile', 'comment-files-count');
     }
 
     function _collectSelectedFiles(filesSource, arr, renderFn, errorId) {
@@ -1095,7 +1565,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         _collectSelectedFiles(
             input.files,
             _pendingFiles,
-            function() { _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile'); },
+            function() { _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count'); },
             'task-files-error'
         );
         $(input).val('');
@@ -1104,7 +1574,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     function handleTaskFilesDrag(event, isOver) {
         event.preventDefault();
         event.stopPropagation();
-        $('#task-files-dropzone').toggleClass('border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-900/30', isOver);
+        $('#task-files-dropzone').toggleClass('kb-dropzone-over', isOver);
     }
 
     function handleTaskFilesDrop(event) {
@@ -1114,7 +1584,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         _collectSelectedFiles(
             event.dataTransfer ? event.dataTransfer.files : [],
             _pendingFiles,
-            function() { _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile'); },
+            function() { _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count'); },
             'task-files-error'
         );
     }
@@ -1123,10 +1593,62 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         _collectSelectedFiles(
             input.files,
             _pendingDetailFiles,
-            function() { _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile'); },
+            function() { _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile', 'detail-task-files-count'); },
             'detail-task-files-error'
         );
         $(input).val('');
+    }
+
+    function handleDetailFilesDrag(event, isOver) {
+        event.preventDefault();
+        event.stopPropagation();
+        $('#detail-task-files-dropzone').toggleClass('border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-900/30', isOver);
+    }
+
+    function handleDetailFilesDrop(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        $('#detail-task-files-dropzone').removeClass('border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-900/30');
+        _collectSelectedFiles(
+            event.dataTransfer ? event.dataTransfer.files : [],
+            _pendingDetailFiles,
+            function() { _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile', 'detail-task-files-count'); },
+            'detail-task-files-error'
+        );
+    }
+
+    // ---- Attachments (comment composer) ----
+
+    function handleCommentFilesSelected(input) {
+        _collectSelectedFiles(
+            input.files,
+            _pendingCommentFiles,
+            _renderCommentPendingFiles,
+            'comment-files-error'
+        );
+        $(input).val('');
+    }
+
+    function handleCommentFilesDrag(event, isOver) {
+        event.preventDefault();
+        event.stopPropagation();
+        $('#comment-files-dropzone').toggleClass('border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-900/30', isOver);
+    }
+
+    function handleCommentFilesDrop(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        $('#comment-files-dropzone').removeClass('border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-900/30');
+        _collectSelectedFiles(
+            event.dataTransfer ? event.dataTransfer.files : [],
+            _pendingCommentFiles,
+            _renderCommentPendingFiles,
+            'comment-files-error'
+        );
+    }
+
+    function _renderCommentPendingFiles() {
+        _renderPendingFiles('comment-files-list', 'comment-files-error', _pendingCommentFiles, '_removePendingCommentFile', 'comment-files-count');
     }
 
     function _clearPendingFiles(arr) {
@@ -1134,19 +1656,78 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         arr.length = 0;
     }
 
-    function uploadAttachments(taskId, files, done) {
+    function _clearCommentPendingFiles() {
+        _clearPendingFiles(_pendingCommentFiles);
+        _renderCommentPendingFiles();
+        const $input = $('#comment-files');
+        if ($input.length) $input.val('');
+        _resetUploadProgress(_COMMENT_PROGRESS);
+    }
+
+    // ---- Upload progress ----
+
+    const _COMMENT_PROGRESS = { wrap: 'comment-upload-progress', track: 'comment-upload-progress-bar', fill: 'comment-upload-progress-fill', pct: 'comment-upload-progress-pct', label: 'comment-upload-progress-label' };
+    const _DETAIL_PROGRESS = { wrap: 'detail-task-upload-progress', track: 'detail-task-upload-progress-bar', fill: 'detail-task-upload-progress-fill', pct: 'detail-task-upload-progress-pct', label: 'detail-task-upload-progress-label' };
+
+    function _setUploadProgress(ids, percent, label) {
+        if (!ids) return;
+        const $wrap = $('#' + ids.wrap);
+        if (!$wrap.length) return;
+        const pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
+        $wrap.removeClass('hidden');
+        $('#' + ids.fill).css('width', pct + '%');
+        $('#' + ids.track).attr('aria-valuenow', String(pct));
+        if (ids.pct) $('#' + ids.pct).text(pct + '%');
+        if (ids.label && label) $('#' + ids.label).text(label);
+    }
+
+    function _resetUploadProgress(ids) {
+        if (!ids) return;
+        const $wrap = $('#' + ids.wrap);
+        if (!$wrap.length) return;
+        $wrap.addClass('hidden');
+        $('#' + ids.fill).css('width', '0%');
+        $('#' + ids.track).attr('aria-valuenow', '0');
+        if (ids.pct) $('#' + ids.pct).text('0%');
+    }
+
+    function _progressXhrFactory(ids, labelFor) {
+        return function() {
+            const xhr = new XMLHttpRequest();
+            if (ids && xhr.upload) {
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (!e.lengthComputable || !e.total) return;
+                    const pct = (e.loaded / e.total) * 100;
+                    _setUploadProgress(ids, pct, labelFor ? labelFor(pct) : null);
+                });
+            }
+            return xhr;
+        };
+    }
+
+    function uploadAttachments(taskId, files, done, progressIds) {
         if (!files || !files.length) { done([]); return; }
         const fd = new FormData();
         files.forEach(f => fd.append('files', f, f.name));
+        const ids = progressIds || null;
+        const label = files.length === 1 ? 'Uploading image\u2026' : 'Uploading ' + files.length + ' images\u2026';
+        if (ids) _setUploadProgress(ids, 0, label);
         $.ajax({
             url: `${API}/tasks/${taskId}/attachments`,
             method: 'POST',
             data: fd,
             processData: false,
             contentType: false,
-            success: function() { done([]); },
+            xhr: _progressXhrFactory(ids, function(pct) { return pct >= 100 ? 'Processing\u2026' : label; }),
+            success: function() {
+                if (ids) _setUploadProgress(ids, 100, 'Uploaded');
+                done([]);
+            },
             error: function(xhr) {
                 done([xhr.responseJSON?.error || 'Attachment upload failed. Please try again.']);
+            },
+            complete: function() {
+                if (ids) setTimeout(function() { _resetUploadProgress(ids); }, 600);
             }
         });
     }
@@ -1259,7 +1840,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         initDepsWidget(null, []);
         _clearPendingFiles(_pendingFiles);
         $('#task-files-error').addClass('hidden').text('');
-        $('#task-files-list').empty();
+        _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count');
         $('#kb-modal').removeClass('hidden').addClass('flex');
     }
 
@@ -1276,7 +1857,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         initDepsWidget(task.id, task.deps || []);
         _clearPendingFiles(_pendingFiles);
         $('#task-files-error').addClass('hidden').text('');
-        $('#task-files-list').empty();
+        _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count');
         $('#modal-title').text('Edit Task');
         $('#modal-submit').text('Save Changes');
         $('#kb-modal').removeClass('hidden').addClass('flex');
@@ -1286,7 +1867,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         _isEditing = false;
         _clearPendingFiles(_pendingFiles);
         $('#task-files-error').addClass('hidden').text('');
-        $('#task-files-list').empty();
+        _renderPendingFiles('task-files-list', 'task-files-error', _pendingFiles, '_removePendingFile', 'task-files-count');
         $('#kb-modal').removeClass('flex').addClass('hidden');
     }
 
@@ -1414,6 +1995,9 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         // Attachments
         _refreshDetailAttachments();
 
+        // Reset the comment composer so pending images never leak between tasks
+        _clearCommentPendingFiles();
+
         switchTab('details');
         $('#kb-detail-modal').removeClass('hidden').addClass('flex');
 
@@ -1423,6 +2007,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     }
 
     function closeDetailModal() {
+        _clearCommentPendingFiles();
         $('#kb-detail-modal').removeClass('flex').addClass('hidden');
         currentDetailId = null;
     }
@@ -1581,27 +2166,29 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
     function submitComment() {
         if (!currentDetailId) return;
         const content = $('#comment-input').val().trim();
-        const files = Array.from($('#comment-files')[0].files || []);
+        const files = _pendingCommentFiles.slice();
         if (!content && !files.length) return;
         const $btn = $('#comment-submit-btn');
         const $spinner = $('#comment-spinner');
         const $btnText = $('#comment-btn-text');
         const formData = new FormData();
         formData.append('content', content);
-        files.forEach(file => formData.append('files', file));
+        files.forEach(file => formData.append('files', file, file.name));
+        const uploadLabel = files.length === 1 ? 'Uploading image\u2026' : 'Uploading ' + files.length + ' images\u2026';
         $btn.prop('disabled', true);
         $spinner.removeClass('hidden');
-        $btnText.text('Posting...');
+        $btnText.text(files.length ? uploadLabel : 'Posting\u2026');
+        if (files.length) _setUploadProgress(_COMMENT_PROGRESS, 0, uploadLabel);
         $.ajax({
             url: `${API}/tasks/${currentDetailId}/comments`,
             method: 'POST',
             data: formData,
             contentType: false,
             processData: false,
+            xhr: _progressXhrFactory(files.length ? _COMMENT_PROGRESS : null, function(pct) { return pct >= 100 ? 'Posting\u2026' : uploadLabel; }),
             success: function(data) {
                 $('#comment-input').val('');
-                $('#comment-files').val('');
-                $('#comment-files-list').empty();
+                _clearCommentPendingFiles();
                 const c = data.comment;
                 if (c) {
                     const $list = $('#comment-list');
@@ -1618,6 +2205,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                 $btn.prop('disabled', false);
                 $spinner.addClass('hidden');
                 $btnText.text('Post Comment');
+                _resetUploadProgress(_COMMENT_PROGRESS);
             }
         });
     }
@@ -1667,9 +2255,9 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         // Attachments: show existing ones and reset the "add new" picker
         renderDetailExistingAttachments(task);
         _clearPendingFiles(_pendingDetailFiles);
-        $('#detail-task-files-list').empty();
-        $('#detail-task-files-error').addClass('hidden').text('');
+        _renderPendingFiles('detail-task-files-list', 'detail-task-files-error', _pendingDetailFiles, '_removePendingDetailFile', 'detail-task-files-count');
         $('#detail-task-files').val('');
+        _resetUploadProgress(_DETAIL_PROGRESS);
 
         $('#panel-details').addClass('hidden');
         $('#panel-edit').removeClass('hidden');
@@ -1707,7 +2295,7 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
                     loadTasks(function() {
                         openDetailModal(taskIdNum);
                     });
-                });
+                }, _DETAIL_PROGRESS);
             },
             error: function(xhr) { alert(xhr.responseJSON?.error || 'Failed to update'); }
         });
@@ -2106,6 +2694,29 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         return !!(agent && agent.avatar_path);
     }
 
+    // Deterministic per-agent avatar background color. Reuses the shared palette
+    // exposed by static/js/agent-sidebar.js (loaded globally via base.html) so
+    // Kanban avatars match the sidebar agent list exactly. The mirrored palette
+    // below is only a safety net for when that script is not present.
+    const _AVATAR_FALLBACK_COLORS = [
+        'hsl(200, 70%, 40%)',
+        'hsl(260, 60%, 45%)',
+        'hsl(330, 60%, 42%)',
+        'hsl(160, 55%, 35%)',
+        'hsl(30, 70%, 38%)',
+        'hsl(290, 50%, 40%)',
+        'hsl(80, 50%, 32%)',
+        'hsl(10, 65%, 40%)',
+    ];
+
+    function avatarBgColor(agentId) {
+        if (typeof _sidebarAvatarColor === 'function') return _sidebarAvatarColor(agentId);
+        let h = 0;
+        const s = String(agentId || '');
+        for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
+        return _AVATAR_FALLBACK_COLORS[Math.abs(h) % _AVATAR_FALLBACK_COLORS.length];
+    }
+
     function showAgentSkillWarning(selectId, warningId) {
         const agentId = $(selectId).val().trim();
         if (!agentId) {
@@ -2126,9 +2737,15 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         const initials = esc(assignee).split(/[\s._-]+/).filter(Boolean).map(s => s[0].toUpperCase()).slice(0, 2).join('');
         const isSuper = assignee === SUPER_AGENT_ID;
         const hasAvatar = hasAgentAvatar(assignee);
+        // Mirror the sidebar agent list: deterministic per-agent background
+        // color; the super agent keeps its red badge as a distinct indicator.
+        const avatarStyle = isSuper ? '' : ` style="background-color:${avatarBgColor(assignee)}"`;
+        const avatarFallbackCls = isSuper
+            ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400'
+            : 'text-white';
         const avatarHtml = hasAvatar
-            ? `<div class="relative inline-flex"><img src="/api/agents/${esc(assignee)}/avatar" alt="" class="w-10 h-10 rounded-full object-cover" title="${esc(assignee)}" onerror="this.onerror=null;this.style.display='none';this.nextElementSibling.style.display='inline-flex'"><span class="hidden items-center justify-center w-10 h-10 rounded-full text-xs font-semibold ${isSuper ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400' : 'bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300'}" title="${esc(assignee)}">${initials}</span></div>`
-            : `<span class="inline-flex items-center justify-center w-10 h-10 rounded-full text-xs font-semibold ${isSuper ? 'bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400' : 'bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300'}" title="${esc(assignee)}">${initials}</span>`;
+            ? `<div class="relative inline-flex"><img src="/api/agents/${esc(assignee)}/avatar" alt="" class="w-10 h-10 rounded-full object-cover" title="${esc(assignee)}" onerror="this.onerror=null;this.style.display='none';this.nextElementSibling.style.display='inline-flex'"><span class="hidden items-center justify-center w-10 h-10 rounded-full text-xs font-semibold ${avatarFallbackCls}"${avatarStyle} title="${esc(assignee)}">${initials}</span></div>`
+            : `<span class="inline-flex items-center justify-center w-10 h-10 rounded-full text-xs font-semibold ${avatarFallbackCls}"${avatarStyle} title="${esc(assignee)}">${initials}</span>`;
         return `<div class="flex flex-col items-start gap-1">
             ${avatarHtml}
             <span class="text-xs ${isSuper ? 'text-red-500 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-400'}">${esc(agentName)}</span>
@@ -2187,31 +2804,55 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
       const $btn = $("#notifier-toggle");
       const $pause = $btn.find(".notifier-pause-icon");
       const $play = $("#notifier-play-icon");
+      const $label = $("#notifier-toggle-label");
       if (isNotifierPaused) {
         $btn
           .removeClass("bg-gray-100 text-gray-700 hover:bg-gray-200")
-          .addClass("bg-red-500 text-white hover:bg-red-600 shadow-md");
-        $btn.attr("title", "Resume agent notifications");
+          .addClass("bg-red-500 text-white hover:bg-red-600 shadow-md")
+          .attr({
+            title: "Kanban scanning paused — resume agent notifications",
+            'aria-label': "Kanban scanning paused — resume agent notifications",
+            'aria-pressed': 'true',
+          });
+        $label.text("Paused");
         $pause.addClass("hidden");
         $play.removeClass("hidden");
       } else {
         $btn
           .removeClass("bg-red-500 text-white hover:bg-red-600 shadow-md")
-          .addClass("bg-gray-100 text-gray-700 hover:bg-gray-200");
-        $btn.attr("title", "Pause agent notifications");
+          .addClass("bg-gray-100 text-gray-700 hover:bg-gray-200")
+          .attr({
+            title: "Kanban scanning running — pause agent notifications",
+            'aria-label': "Kanban scanning running — pause agent notifications",
+            'aria-pressed': 'false',
+          });
+        $label.text("Running");
         $pause.removeClass("hidden");
         $play.addClass("hidden");
       }
     }
 
     function toggleNotifier() {
-      isNotifierPaused = !isNotifierPaused;
+      const $btn = $("#notifier-toggle");
+      if ($btn.prop('disabled')) return;
+      const previousState = isNotifierPaused;
+      isNotifierPaused = !previousState;
+      $btn.prop('disabled', true).addClass('opacity-70 cursor-wait');
       updateNotifierUI();
       $.ajax({
         url: '/api/kanban/notifier/toggle',
         method: 'POST',
         contentType: 'application/json',
         data: JSON.stringify({ paused: isNotifierPaused }),
+      }).done(function(data) {
+        isNotifierPaused = Boolean(data.paused);
+        updateNotifierUI();
+      }).fail(function() {
+        isNotifierPaused = previousState;
+        updateNotifierUI();
+        toast.show('Failed to update Kanban scanner state', 'error');
+      }).always(function() {
+        $btn.prop('disabled', false).removeClass('opacity-70 cursor-wait');
       });
     }
 
@@ -2267,8 +2908,605 @@ html.dark .skeleton-card .sk-actions { border-color: #4b5563; }
         showAgentSkillWarning('#detail-task-assignee', '#detail-task-assignee-warning');
     });
 
+    // ── Task flash on tool calls (SSE channel: kanban) ─────────────────────
+    // A tool call turns the task title solid yellow, then the highlight
+    // slowly shades back to the original color. Every new tool call snaps
+    // it back to solid yellow and restarts the fade.
+    const TASK_FLASH_GRACE_MS = 3000;   // idle event: end the flash after this long
+    const TASK_FLASH_STALE_MS = 15000;  // ignore replayed events older than this
+    const _flashState = new Map();      // taskId -> {startedAt, decayMs, flashUntil}
+    let _flashTicker = null;
+    let _flashClientReady = false;
+
+    function _flashEls(taskId) {
+        // Cards are rendered as [data-id="<task id>"]; the title lives inside.
+        return document.querySelectorAll('[data-id="' + taskId + '"] .kb-task-title');
+    }
+
+    function _applyFlash(taskId, seekMs) {
+        const st = _flashState.get(String(taskId));
+        if (!st) return;
+        _flashEls(taskId).forEach(function(el) {
+            el.style.setProperty('--kb-decay', st.decayMs + 'ms');
+            const seek = Math.max(0, seekMs);
+            el.style.setProperty('--kb-seek', seek > 0 ? '-' + seek + 'ms' : '0ms');
+            el.classList.remove('kb-flash');
+            void el.offsetWidth;  // force reflow so the animation restarts
+            el.classList.add('kb-flash');
+        });
+    }
+
+    function _startFlash(taskId, decayMs) {
+        const id = String(taskId);
+        const now = Date.now();
+        _flashState.set(id, { startedAt: now, decayMs: decayMs, flashUntil: now + decayMs });
+        _applyFlash(id, 0);
+        _ensureFlashTicker();
+    }
+
+    function _endFlash(taskId, graceMs) {
+        const st = _flashState.get(String(taskId));
+        if (!st) return;
+        st.flashUntil = Math.min(st.flashUntil, Date.now() + Math.max(0, graceMs));
+        _ensureFlashTicker();
+    }
+
+    function _clearFlash(taskId) {
+        _flashState.delete(String(taskId));
+        _flashEls(taskId).forEach(function(el) {
+            el.classList.remove('kb-flash');
+            el.style.removeProperty('--kb-seek');
+        });
+    }
+
+    function _ensureFlashTicker() {
+        if (_flashTicker) return;
+        _flashTicker = setInterval(_tickFlash, 250);
+    }
+
+    function _tickFlash() {
+        const now = Date.now();
+        let live = 0;
+        Array.from(_flashState.keys()).forEach(function(id) {
+            const st = _flashState.get(id);
+            if (!st) return;
+            if (st.flashUntil <= now) { _clearFlash(id); return; }
+            live++;
+            // Re-apply after a re-render, continuing (not restarting) the fade.
+            _flashEls(id).forEach(function(el) {
+                if (!el.classList.contains('kb-flash')) _applyFlash(id, now - st.startedAt);
+            });
+        });
+        if (!live && _flashTicker) { clearInterval(_flashTicker); _flashTicker = null; }
+    }
+
+    function _initTaskFlash() {
+        if (_flashClientReady || !TASK_FLASH_ENABLED) return;
+        if (typeof RealtimeClient === 'undefined') return;
+        _flashClientReady = true;
+        try {
+            const rt = new RealtimeClient({ channels: 'kanban' });
+            rt.on('kanban', 'kanban_task_activity', function(data) {
+                if (!data || !data.task_id) return;
+                if (data.timestamp && (Date.now() - data.timestamp) > TASK_FLASH_STALE_MS) return;
+                const secs = Number(data.decay_seconds) || (TASK_FLASH_DECAY_MS / 1000);
+                _startFlash(data.task_id, Math.max(1, secs) * 1000);
+            });
+            rt.on('kanban', 'kanban_task_idle', function(data) {
+                if (!data || !data.task_id) return;
+                if (data.timestamp && (Date.now() - data.timestamp) > TASK_FLASH_STALE_MS) return;
+                const grace = Number(data.grace_seconds) || (TASK_FLASH_GRACE_MS / 1000);
+                _endFlash(data.task_id, Math.max(0, grace) * 1000);
+            });
+            rt.start();
+        } catch (e) {
+            console.warn('[kanban] task flash unavailable', e);
+        }
+    }
+
+    // realtime.js is loaded with defer, so wait for it before connecting.
+    window.addEventListener('load', _initTaskFlash);
+    if (typeof RealtimeClient !== 'undefined') _initTaskFlash();
+
+
+    // ── Table view + bulk actions ─────────────────────────────────────────────
+
+    let viewMode = 'board';
+    try { viewMode = localStorage.getItem('kanban_view') === 'table' ? 'table' : 'board'; } catch (e) {}
+    let tableSort = { key: 'updated_at', dir: 'desc' };
+    const selectedIds = new Set();
+    let tablePage = 1;
+    let tablePageSize = 25;
+    try { const saved = parseInt(localStorage.getItem('kanban_page_size'), 10); if ([10, 25, 50, 100].includes(saved)) tablePageSize = saved; } catch (e) {}
+    let tableViewSig = '';
+    let tablePageRows = [];      // tasks on the page currently shown, in display order
+    let selAnchorId = null;      // last row clicked: start of a Shift range
+    let selAnchorState = true;   // whether that click selected or deselected it
+    let selDrag = null;          // active drag-select: { startIdx, curIdx, target, base:Set }
+    let selRenderPending = false;
+    let selScrollRaf = 0;
+    let selLastY = 0;
+    let selTipDismissed = false;
+    try { selTipDismissed = localStorage.getItem('kanban_select_tip') === '1'; } catch (e) {}
+
+    const TABLE_COLUMNS = [
+        { key: 'id', label: 'ID' },
+        { key: 'title', label: 'Title' },
+        { key: 'status', label: 'Status' },
+        { key: 'priority', label: 'Priority' },
+        { key: 'assignee', label: 'Assignee' },
+        { key: 'deps', label: 'Deps' },
+        { key: 'updated_at', label: 'Updated' },
+    ];
+    const STATUS_LABEL = { 'todo': 'Todo', 'in-progress': 'In Progress', 'done': 'Done' };
+    const STATUS_BADGE = {
+        'todo': 'bg-gray-100 dark:bg-gray-600 text-gray-600 dark:text-gray-200',
+        'in-progress': 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+        'done': 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
+    };
+    const PRIORITY_RANK = { high: 3, medium: 2, low: 1 };
+
+    function setViewMode(mode) {
+        viewMode = mode === 'table' ? 'table' : 'board';
+        try { localStorage.setItem('kanban_view', viewMode); } catch (e) {}
+        applyViewMode();
+    }
+
+    function applyViewMode() {
+        const isTable = viewMode === 'table';
+        $('#board-view').toggleClass('hidden', isTable);
+        $('#table-view').toggleClass('hidden', !isTable);
+        $('#view-switch').attr('data-active', viewMode);
+        $('#view-btn-board').attr('aria-selected', String(!isTable));
+        $('#view-btn-table').attr('aria-selected', String(isTable));
+        if (isTable) { populateTableAgentSelects(); renderTable(); }
+    }
+
+    function populateTableAgentSelects() {
+        const agents = _agentCache || [];
+        const opts = agents.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+        const $f = $('#tf-assignee');
+        const cur = $f.val();
+        $f.html('<option value="">Assignee: All</option><option value="__none__">Unassigned</option>' + opts);
+        if (cur) $f.val(cur);
+        $('#bulk-assignee').html('<option value="">Assign to…</option><option value="__none__">Unassigned</option>' + opts);
+    }
+
+    function onTableFilterChange() { renderTable(); }
+
+    function resetTableFilters() {
+        $('#tf-status').val('active');
+        $('#tf-priority, #tf-assignee, #tf-deps').val('');
+        clearSearch();
+        renderTable();
+    }
+
+    function getFilteredTableTasks() {
+        const kw = searchKeyword.toLowerCase();
+        const st = $('#tf-status').val() || 'active';
+        const pr = $('#tf-priority').val();
+        const as = $('#tf-assignee').val();
+        const dp = $('#tf-deps').val();
+        const list = tasks.filter(t => {
+            if (st === 'active' && t.archived_at) return false;
+            if (st === 'archived' && !t.archived_at) return false;
+            if (['todo', 'in-progress', 'done'].includes(st) && (t.status !== st || t.archived_at)) return false;
+            if (pr && t.priority !== pr) return false;
+            if (as === '__none__' ? !!t.assignee : (as && t.assignee !== as)) return false;
+            if (dp === 'blocked' && t.deps_met !== false) return false;
+            if (dp === 'ready' && t.deps_met === false) return false;
+            if (kw && !((t.title || '').toLowerCase().includes(kw) ||
+                        (t.description || '').toLowerCase().includes(kw) ||
+                        String(t.id).includes(kw))) return false;
+            return true;
+        });
+        const dir = tableSort.dir === 'asc' ? 1 : -1;
+        const val = t => {
+            switch (tableSort.key) {
+                case 'id': return t.id;
+                case 'title': return (t.title || '').toLowerCase();
+                case 'status': return t.archived_at ? 'archived' : (t.status || '');
+                case 'priority': return PRIORITY_RANK[t.priority] || 0;
+                case 'assignee': return (getAgentName(t.assignee) || '').toLowerCase();
+                case 'deps': return (t.deps || []).length;
+                default: return new Date(t.updated_at || t.created_at || 0).getTime();
+            }
+        };
+        return list.sort((a, b) => {
+            const x = val(a), y = val(b);
+            return x < y ? -dir : x > y ? dir : b.id - a.id;
+        });
+    }
+
+    function sortTable(key) {
+        tableSort = { key, dir: tableSort.key === key && tableSort.dir === 'asc' ? 'desc' : 'asc' };
+        renderTable();
+    }
+
+    function renderTable() {
+        // A re-render mid-drag would swap the rows under the pointer; run it once the drag ends.
+        if (selDrag) { selRenderPending = true; return; }
+        const allRows = getFilteredTableTasks();
+        // Back to page 1 whenever the filters, search or sort change (not on plain auto-refresh).
+        const sig = JSON.stringify([$('#tf-status').val(), $('#tf-priority').val(), $('#tf-assignee').val(), $('#tf-deps').val(), searchKeyword, tableSort]);
+        if (sig !== tableViewSig) { tableViewSig = sig; tablePage = 1; selAnchorId = null; }
+        const totalPages = Math.max(1, Math.ceil(allRows.length / tablePageSize));
+        tablePage = Math.min(Math.max(1, tablePage), totalPages);
+        const startIdx = (tablePage - 1) * tablePageSize;
+        const rows = allRows.slice(startIdx, startIdx + tablePageSize);
+        tablePageRows = rows;
+
+        // Selection survives paging, but only tasks matching the current filters may stay selected.
+        const filteredIds = new Set(allRows.map(t => t.id));
+        selectedIds.forEach(id => { if (!filteredIds.has(id)) selectedIds.delete(id); });
+
+        // Header checkbox reflects the current page only.
+        const allSel = rows.length > 0 && rows.every(t => selectedIds.has(t.id));
+        const someSel = rows.some(t => selectedIds.has(t.id));
+        const th = 'px-3 py-2 text-left font-semibold whitespace-nowrap select-none';
+        let head = `<th class="${th} w-8"><input type="checkbox" id="select-all" ${allSel ? 'checked' : ''} onchange="toggleSelectAll(this.checked)" aria-label="Select all" title="Select all rows on this page"></th>`;
+        TABLE_COLUMNS.forEach(c => {
+            const arrow = tableSort.key === c.key ? (tableSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+            head += `<th class="${th} cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-300" onclick="sortTable('${c.key}')">${c.label}${arrow}</th>`;
+        });
+        $('#table-head').html(head);
+        const selAll = document.getElementById('select-all');
+        if (selAll) selAll.indeterminate = someSel && !allSel;
+
+        if (rows.length === 0) {
+            $('#table-body').html(`<tr><td colspan="${TABLE_COLUMNS.length + 1}" class="px-3 py-8 text-center text-gray-400">No tasks match the current filters</td></tr>`);
+        } else {
+            $('#table-body').html(rows.map(t => {
+                const checked = selectedIds.has(t.id);
+                const status = t.archived_at ? 'archived' : t.status;
+                const sBadge = t.archived_at ? STATUS_BADGE.todo : (STATUS_BADGE[t.status] || STATUS_BADGE.todo);
+                const sLabel = t.archived_at ? 'Archived' : (STATUS_LABEL[t.status] || t.status);
+                const pBadge = PRIORITY_BADGE[t.priority] || PRIORITY_BADGE.medium;
+                const deps = (t.deps || []);
+                const depsCell = deps.length
+                    ? `<span class="${t.deps_met === false ? 'text-amber-600 dark:text-amber-400' : 'text-gray-500 dark:text-gray-400'}" title="${t.deps_met === false ? 'Blocked by unmet dependencies' : 'All dependencies met'}">${deps.map(d => '#' + d).join(', ')}</span>`
+                    : '<span class="text-gray-300 dark:text-gray-600">—</span>';
+                return `<tr class="kb-row${checked ? ' kb-row-selected' : ''}" data-id="${t.id}" data-status="${esc(status)}">
+                    <td class="px-3 py-2 kb-cb-cell" title="Shift+click selects a range · drag down the checkboxes to select several"><input type="checkbox" class="kb-cb" ${checked ? 'checked' : ''} aria-label="Select task ${t.id}"></td>
+                    <td class="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">#${t.id}</td>
+                    <td class="px-3 py-2 kb-title-cell"><a href="javascript:void(0)" onclick="openDetailModal(${t.id})" class="font-medium text-gray-900 dark:text-gray-100 hover:text-indigo-600 dark:hover:text-indigo-300">${esc(t.title)}</a></td>
+                    <td class="px-3 py-2 whitespace-nowrap"><span class="text-xs font-medium px-2 py-0.5 rounded-full ${sBadge}">${esc(sLabel)}</span></td>
+                    <td class="px-3 py-2 whitespace-nowrap"><span class="text-xs font-medium px-2 py-0.5 rounded-full ${pBadge}">${esc(t.priority || 'medium')}</span></td>
+                    <td class="px-3 py-2 whitespace-nowrap text-gray-700 dark:text-gray-200">${t.assignee ? esc(getAgentName(t.assignee)) : '<span class="text-gray-300 dark:text-gray-600">—</span>'}</td>
+                    <td class="px-3 py-2 whitespace-nowrap">${depsCell}</td>
+                    <td class="px-3 py-2 whitespace-nowrap text-gray-500 dark:text-gray-400">${fmtShort(t.updated_at || t.created_at)}</td>
+                </tr>`;
+            }).join(''));
+        }
+        const from = allRows.length ? startIdx + 1 : 0;
+        $('#table-summary').text(allRows.length === tasks.length
+            ? `${from}–${startIdx + rows.length} of ${allRows.length} tasks`
+            : `${from}–${startIdx + rows.length} of ${allRows.length} matching (${tasks.length} total)`);
+        $('#page-indicator').text(`Page ${tablePage} of ${totalPages}`);
+        $('#page-prev').prop('disabled', tablePage <= 1);
+        $('#page-next').prop('disabled', tablePage >= totalPages);
+        if (String($('#page-size').val()) !== String(tablePageSize)) $('#page-size').val(String(tablePageSize));
+        const tip = document.getElementById('select-tip');
+        if (tip) tip.hidden = selTipDismissed || allRows.length < 2;
+        updateBulkBar(rows);
+    }
+
+    // Repaint checkboxes, row highlight, header checkbox and bulk bar without rebuilding the table.
+    function syncRowSelection() {
+        const body = document.getElementById('table-body');
+        if (!body) return;
+        body.querySelectorAll('tr[data-id]').forEach(tr => {
+            const on = selectedIds.has(Number(tr.dataset.id));
+            tr.classList.toggle('kb-row-selected', on);
+            const cb = tr.querySelector('.kb-cb');
+            if (cb && cb.checked !== on) cb.checked = on;
+        });
+        const allSel = tablePageRows.length > 0 && tablePageRows.every(t => selectedIds.has(t.id));
+        const someSel = tablePageRows.some(t => selectedIds.has(t.id));
+        const selAll = document.getElementById('select-all');
+        if (selAll) { selAll.checked = allSel; selAll.indeterminate = someSel && !allSel; }
+        updateBulkBar(tablePageRows);
+    }
+
+    // Drag semantics: every row the drag overlaps flips relative to how it was before the drag started,
+    // so a selected row becomes deselected and an unselected row becomes selected.
+    function selApplyToggle(base, from, to) {
+        selectedIds.clear();
+        base.forEach(id => selectedIds.add(id));
+        const lo = Math.min(from, to), hi = Math.max(from, to);
+        for (let i = lo; i <= hi; i++) {
+            const t = tablePageRows[i];
+            if (!t) continue;
+            if (base.has(t.id)) selectedIds.delete(t.id); else selectedIds.add(t.id);
+        }
+        syncRowSelection();
+    }
+
+    function selIndexOf(id) { return tablePageRows.findIndex(t => t.id === id); }
+
+    // Set rows from..to (inclusive, either order) to `on`, starting from the `base` selection.
+    function selApplyRange(base, from, to, on) {
+        selectedIds.clear();
+        base.forEach(id => selectedIds.add(id));
+        const lo = Math.min(from, to), hi = Math.max(from, to);
+        for (let i = lo; i <= hi; i++) {
+            const t = tablePageRows[i];
+            if (!t) continue;
+            if (on) selectedIds.add(t.id); else selectedIds.delete(t.id);
+        }
+        syncRowSelection();
+    }
+
+    // Row index under a screen Y, clamped to the first/last row so dragging past the table still works.
+    function selRowIndexAtY(y) {
+        const rows = document.querySelectorAll('#table-body tr[data-id]');
+        if (!rows.length) return -1;
+        for (let i = 0; i < rows.length; i++) {
+            if (y < rows[i].getBoundingClientRect().bottom) return i;
+        }
+        return rows.length - 1;
+    }
+
+    function dismissSelectTip() {
+        selTipDismissed = true;
+        try { localStorage.setItem('kanban_select_tip', '1'); } catch (e) {}
+        const tip = document.getElementById('select-tip');
+        if (tip) tip.hidden = true;
+    }
+
+    function showSelectTip() {
+        selTipDismissed = false;
+        try { localStorage.removeItem('kanban_select_tip'); } catch (e) {}
+        const tip = document.getElementById('select-tip');
+        if (tip) tip.hidden = false;
+    }
+
+    function selChip() {
+        let chip = document.getElementById('sel-drag-chip');
+        if (!chip) {
+            chip = document.createElement('div');
+            chip.id = 'sel-drag-chip';
+            chip.className = 'kb-drag-chip';
+            chip.hidden = true;
+            document.body.appendChild(chip);
+        }
+        return chip;
+    }
+
+    // Highlight the rows inside the dragged range and keep a small label next to the pointer.
+    // Nothing is shown until the pointer actually leaves the first row, so a plain click stays clean.
+    function selDragPaint(x, y) {
+        if (!selDrag) return;
+        const moved = selDrag.curIdx !== selDrag.startIdx;
+        const lo = Math.min(selDrag.startIdx, selDrag.curIdx), hi = Math.max(selDrag.startIdx, selDrag.curIdx);
+        let adding = 0, removing = 0;
+        document.querySelectorAll('#table-body tr[data-id]').forEach((tr, i) => {
+            const inRange = moved && i >= lo && i <= hi;
+            const wasOn = inRange && selDrag.base.has(Number(tr.dataset.id));
+            tr.classList.toggle('kb-row-drag', inRange && !wasOn);        // will become selected
+            tr.classList.toggle('kb-row-drag-off', inRange && wasOn);     // will become deselected
+            if (inRange) { if (wasOn) removing++; else adding++; }
+        });
+        const chip = selChip();
+        chip.hidden = !moved;
+        if (!moved) return;
+        const parts = [];
+        if (adding) parts.push('Select ' + adding);
+        if (removing) parts.push('Deselect ' + removing);
+        chip.textContent = parts.join(' · ');
+        chip.classList.toggle('kb-chip-off', adding === 0);
+        if (x != null) {
+            // Keep the label inside the window: flip above the pointer near the bottom, pull in from the right edge.
+            const w = chip.offsetWidth || 120, h = chip.offsetHeight || 26;
+            const left = Math.max(8, Math.min(x + 16, window.innerWidth - w - 8));
+            const top = (y + 18 + h > window.innerHeight - 8) ? Math.max(8, y - h - 14) : y + 18;
+            chip.style.left = left + 'px';
+            chip.style.top = top + 'px';
+        }
+    }
+
+    function selFinishDrag() {
+        const moved = selDrag && selDrag.curIdx !== selDrag.startIdx;
+        selDrag = null;
+        const chip = document.getElementById('sel-drag-chip');
+        if (chip) chip.hidden = true;
+        document.querySelectorAll('#table-body tr.kb-row-drag, #table-body tr.kb-row-drag-off')
+            .forEach(tr => tr.classList.remove('kb-row-drag', 'kb-row-drag-off'));
+        if (moved) dismissSelectTip();      // they found the feature, no need to keep hinting
+        document.body.classList.remove('kb-select-dragging');
+        if (selScrollRaf) { cancelAnimationFrame(selScrollRaf); selScrollRaf = 0; }
+        if (selRenderPending) { selRenderPending = false; renderTable(); }
+    }
+
+    // Scroll the page while the pointer is held near the top/bottom edge of the window.
+    function selAutoScroll() {
+        selScrollRaf = 0;
+        if (!selDrag) return;
+        const edge = 70, max = 22;
+        let dy = 0;
+        if (selLastY < edge) dy = -Math.ceil(max * (edge - selLastY) / edge);
+        else if (selLastY > window.innerHeight - edge) dy = Math.ceil(max * (selLastY - (window.innerHeight - edge)) / edge);
+        if (dy) {
+            window.scrollBy(0, dy);
+            const idx = selRowIndexAtY(selLastY);
+            if (idx >= 0 && idx !== selDrag.curIdx) {
+                selDrag.curIdx = idx;
+                selApplyToggle(selDrag.base, selDrag.startIdx, idx);
+            }
+            selDragPaint();
+        }
+        selScrollRaf = requestAnimationFrame(selAutoScroll);
+    }
+
+    // Plain click toggles one row, Ctrl/Cmd+click toggles without moving the anchor,
+    // Shift+click selects everything between the anchor and the clicked row.
+    function selClickRow(id, e) {
+        const idx = selIndexOf(id);
+        if (idx < 0) return;
+        const anchorIdx = selAnchorId == null ? -1 : selIndexOf(selAnchorId);
+        if (e.shiftKey && anchorIdx >= 0) {
+            selApplyRange(new Set(selectedIds), anchorIdx, idx, selAnchorState);
+            dismissSelectTip();
+            return;
+        }
+        const on = !selectedIds.has(id);
+        if (on) selectedIds.add(id); else selectedIds.delete(id);
+        if (!(e.ctrlKey || e.metaKey)) { selAnchorId = id; selAnchorState = on; }
+        syncRowSelection();
+    }
+
+    function initTableSelection() {
+        const body = document.getElementById('table-body');
+        if (!body || body._selReady) return;
+        body._selReady = true;
+
+        body.addEventListener('mousedown', function (e) {
+            if (e.button !== 0) return;
+            const cell = e.target.closest('.kb-cb-cell');
+            if (!cell) return;
+            const tr = cell.closest('tr[data-id]');
+            if (!tr) return;
+            e.preventDefault();                       // no text selection, no native toggle
+            const id = Number(tr.dataset.id);
+            if (e.shiftKey || e.ctrlKey || e.metaKey) { selClickRow(id, e); return; }
+            const idx = selIndexOf(id);
+            const target = !selectedIds.has(id);
+            selDrag = { startIdx: idx, curIdx: idx, target, base: new Set(selectedIds) };
+            selAnchorId = id; selAnchorState = target;
+            selLastY = e.clientY;
+            document.body.classList.add('kb-select-dragging');
+            selApplyToggle(selDrag.base, idx, idx);
+            if (!selScrollRaf) selScrollRaf = requestAnimationFrame(selAutoScroll);
+        });
+
+        document.addEventListener('mousemove', function (e) {
+            if (!selDrag) return;
+            selLastY = e.clientY;
+            const idx = selRowIndexAtY(e.clientY);
+            if (idx >= 0 && idx !== selDrag.curIdx) {
+                selDrag.curIdx = idx;
+                selApplyToggle(selDrag.base, selDrag.startIdx, idx);
+            }
+            selDragPaint(e.clientX, e.clientY);
+        });
+
+        document.addEventListener('mouseup', function () { if (selDrag) selFinishDrag(); });
+        window.addEventListener('blur', function () { if (selDrag) selFinishDrag(); });
+        document.addEventListener('keydown', function (e) {
+            if (e.key !== 'Escape' || !selDrag) return;
+            selectedIds.clear(); selDrag.base.forEach(id => selectedIds.add(id));
+            syncRowSelection();
+            selFinishDrag();
+        });
+
+        // Mouse selection is handled on mousedown; this only serves the keyboard (Space, Shift+Space).
+        body.addEventListener('click', function (e) {
+            const cb = e.target.closest('.kb-cb');
+            if (!cb) return;
+            e.preventDefault();
+            if (e.detail === 0) {
+                const tr = cb.closest('tr[data-id]');
+                if (tr) selClickRow(Number(tr.dataset.id), e);
+            }
+            setTimeout(syncRowSelection, 0);
+        });
+    }
+
+    function toggleSelectAll(on) {
+        const start = (tablePage - 1) * tablePageSize;
+        getFilteredTableTasks().slice(start, start + tablePageSize)
+            .forEach(t => { if (on) selectedIds.add(t.id); else selectedIds.delete(t.id); });
+        selAnchorId = null;
+        renderTable();
+    }
+
+    function gotoPage(n) { tablePage = n; renderTable(); }
+
+    function setPageSize(v) {
+        const n = parseInt(v, 10);
+        if (![10, 25, 50, 100].includes(n)) return;
+        tablePageSize = n;
+        tablePage = 1;
+        try { localStorage.setItem('kanban_page_size', String(n)); } catch (e) {}
+        renderTable();
+    }
+
+    function clearSelection() { selectedIds.clear(); selAnchorId = null; renderTable(); }
+
+    function updateBulkBar(pageRows) {
+        const wrap = document.getElementById('bulk-wrap');
+        const open = selectedIds.size > 0;
+        // While the card slides away keep the last numbers so it doesn't flash "0 selected".
+        if (open) {
+            $('#bulk-count').text(selectedIds.size);
+            const onPage = (pageRows || []).filter(t => selectedIds.has(t.id)).length;
+            const other = selectedIds.size - onPage;
+            $('#bulk-offpage').text(other > 0 && pageRows ? ` (${other} on other pages)` : '');
+        }
+        if (wrap) {
+            wrap.classList.toggle('is-open', open);
+            wrap.setAttribute('aria-hidden', open ? 'false' : 'true');
+        }
+    }
+
+    // Run one request per selected task, then report how many succeeded.
+    function runBulk(label, ids, request) {
+        const calls = ids.map(id => new Promise(resolve => {
+            request(id).done(() => resolve({ id, ok: true }))
+                .fail(xhr => resolve({ id, ok: false, error: xhr.responseJSON?.error || 'failed' }));
+        }));
+        return Promise.all(calls).then(results => {
+            const failed = results.filter(r => !r.ok);
+            const okCount = results.length - failed.length;
+            if (failed.length === 0) {
+                toast.show(`${okCount} task${okCount === 1 ? '' : 's'} ${label}`, 'success');
+            } else {
+                const detail = failed.slice(0, 3).map(f => `#${f.id}: ${f.error}`).join('; ');
+                toast.show(`${okCount} ${label}, ${failed.length} failed (${detail})`, 'error', 6000);
+            }
+            previousTasksFingerprint = '';
+            loadTasks();
+        });
+    }
+
+    function bulkSelectAction(sel, field) {
+        const value = sel.value;
+        sel.value = '';
+        if (!value || selectedIds.size === 0) return;
+        const ids = [...selectedIds];
+        const payload = field === 'assignee' ? { assignee: value === '__none__' ? '' : value } : { [field]: value };
+        runBulk(`updated (${field})`, ids, id => $.ajax({
+            url: `${API}/tasks/${id}`, method: 'PUT',
+            contentType: 'application/json', data: JSON.stringify(payload),
+        }));
+    }
+
+    function bulkArchive(archive) {
+        if (selectedIds.size === 0) return;
+        const verb = archive ? 'archive' : 'unarchive';
+        runBulk(archive ? 'archived' : 'unarchived', [...selectedIds], id => $.post(`${API}/tasks/${id}/${verb}`));
+    }
+
+    async function bulkDelete() {
+        const ids = [...selectedIds];
+        if (ids.length === 0) return;
+        const confirmed = await showConfirm({
+            title: 'Delete Tasks',
+            message: `Are you sure you want to delete ${ids.length} selected task${ids.length === 1 ? '' : 's'}? This action cannot be undone.`,
+            confirmText: 'Delete',
+            cancelText: 'Cancel',
+            danger: true
+        });
+        if (!confirmed) return;
+        runBulk('deleted', ids, id => $.ajax({ url: `${API}/tasks/${id}`, method: 'DELETE' }));
+    }
+
+    initTableSelection();
+    applyViewMode();
+
     fetchNotifierStatus();
     preloadAgentCache(function() {
+        populateTableAgentSelects();
         loadTasks();
     });
 </script>
