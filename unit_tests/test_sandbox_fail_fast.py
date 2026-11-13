@@ -124,3 +124,37 @@ def test_ssh_connect_is_bounded_and_names_host_and_port(monkeypatch):
     assert 'fep@100.99.99.99:2222' in message
     assert f'within {ssh_backend.SSH_CONNECT_TIMEOUT}s' in message
     assert 'timed out' in message
+
+
+class _FakeProc:
+    pid = 4242
+
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def _run_bash_with_no_result(monkeypatch, returncode):
+    """Drive run_bash with a poll loop that never gets output."""
+    backend = docker_backend.DockerBackend(session_id='pit-373-bash')
+    monkeypatch.setattr(
+        docker_backend, '_get_or_create_container', lambda *a, **k: ('cid', None))
+    monkeypatch.setattr(docker_backend, '_docker_popen', lambda *a, **k: _FakeProc(returncode))
+    monkeypatch.setattr(
+        docker_backend.DockerBackend, '_poll_proc', staticmethod(lambda *a, **k: (None, None)))
+    return backend.run_bash('sleep 60', timeout=7, env={})
+
+
+def test_a_timed_out_bash_call_says_timed_out(monkeypatch):
+    """A timeout is not a user stop: the old branch reported every no-result
+    poll as 'stopped by user', which read as a deliberate halt."""
+    result = _run_bash_with_no_result(monkeypatch, returncode=None)
+
+    assert result['error'] == 'Execution timed out after 7s'
+    assert result['exit_code'] == -1
+
+
+def test_a_killed_bash_call_still_says_stopped_by_user(monkeypatch):
+    result = _run_bash_with_no_result(monkeypatch, returncode=-15)
+
+    assert result['error'] == 'Execution stopped by user'
+    assert result['exit_code'] == -9

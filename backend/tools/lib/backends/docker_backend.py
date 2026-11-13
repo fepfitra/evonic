@@ -748,10 +748,20 @@ class DockerBackend(ExecutionBackend):
         try:
             stdout, stderr = self._poll_proc(proc, _PATH_PREFIX + script, timeout + 5, t0)
             if stdout is None:
-                # Process was killed externally
+                if proc.returncode is not None and proc.returncode < 0:
+                    # Process was killed externally
+                    return {
+                        'error': 'Execution stopped by user',
+                        'exit_code': -9,
+                        'execution_time': round(time.time() - t0, 3),
+                    }
+                # PIT-373: a timeout is a timeout, not a user stop.  Reporting
+                # every None as "stopped by user" let a hung tool call read as a
+                # deliberate halt, and the model filled the gap with its own
+                # infrastructure guess ("workspace down").
                 return {
-                    'error': 'Execution stopped by user',
-                    'exit_code': -9,
+                    'error': f'Execution timed out after {timeout}s',
+                    'exit_code': -1,
                     'execution_time': round(time.time() - t0, 3),
                 }
         finally:
