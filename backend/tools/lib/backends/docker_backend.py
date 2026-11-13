@@ -34,6 +34,8 @@ try:
         SANDBOX_IMAGE,
         SANDBOX_MAX_CONTAINERS,
         SANDBOX_PERSISTENT_CONTAINER_ENABLED,
+        SANDBOX_IMAGE_CHECK_TTL,
+        SANDBOX_IMAGE_CHECK_TIMEOUT,
     )
 except ImportError:
     SANDBOX_WORKSPACE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
@@ -44,6 +46,8 @@ except ImportError:
     SANDBOX_IMAGE = 'evonic-sandbox:latest'
     SANDBOX_MAX_CONTAINERS = 10
     SANDBOX_PERSISTENT_CONTAINER_ENABLED = True
+    SANDBOX_IMAGE_CHECK_TTL = 60
+    SANDBOX_IMAGE_CHECK_TIMEOUT = 5
 
 # Directory containing the evonic helper package (mounted into the container)
 _HELPERS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'runpy_helpers'))
@@ -90,6 +94,71 @@ _containers: dict = {}   # session_id -> {container_id, container_name, agent_id
 _pool_lock = threading.Lock()
 _reaper_thread: threading.Thread = None
 _monitor_thread: threading.Thread = None
+
+# PIT-373: cache the one `docker image inspect` per image so a turn does not pay
+# for it on every tool call.  Value is (error_or_None, checked_at).
+_image_cache: dict = {}
+_image_lock = threading.Lock()
+
+
+def _reset_image_cache() -> None:
+    """Clear the cached image verdict (tests and a manual rebuild)."""
+    with _image_lock:
+        _image_cache.clear()
+
+
+def sandbox_image_error(image: str = None, timeout: int = None) -> str:
+    """Return a precise error when the sandbox image cannot be used, else ''.
+
+    One cheap `docker image inspect` before a container is created, so a missing
+    image becomes a fast named error instead of a `docker run` that tries a pull
+    and a model that guesses "workspace down".  Positive verdicts are cached for
+    SANDBOX_IMAGE_CHECK_TTL, negative ones for a third of it so a manual
+    `docker build` is picked up without restarting the platform.
+    """
+    image = image or SANDBOX_IMAGE
+    timeout = SANDBOX_IMAGE_CHECK_TIMEOUT if timeout is None else timeout
+    error_ttl = max(1, SANDBOX_IMAGE_CHECK_TTL // 3)
+    now = time.time()
+    with _image_lock:
+        cached = _image_cache.get(image)
+    if cached is not None:
+        error, checked_at = cached
+        if now - checked_at < (error_ttl if error else SANDBOX_IMAGE_CHECK_TTL):
+            return error
+
+    def remember(error: str) -> str:
+        with _image_lock:
+            _image_cache[image] = (error, now)
+        return error
+
+    try:
+        result = _docker('image', 'inspect', image, timeout=timeout)
+    except FileNotFoundError:
+        return remember(
+            f'The Docker CLI is not installed on this host, so the sandbox image '
+            f'`{image}` cannot be used. The agent cannot read or write files '
+            'until Docker is installed and the image is built.')
+    except subprocess.TimeoutExpired:
+        return remember(
+            f'`docker image inspect {image}` did not answer within {timeout}s. '
+            'The Docker daemon is not responding; the agent cannot read or write '
+            'files until Docker is healthy.')
+
+    if result.returncode == 0:
+        return remember('')
+
+    stderr = (result.stderr or '').strip()
+    lowered = stderr.lower()
+    if 'no such image' in lowered or 'not found' in lowered or 'pull access denied' in lowered:
+        return remember(
+            f'The sandbox image `{image}` is not present on this host; the agent '
+            'cannot read or write files until it is built. Build it with:\n'
+            f'    docker build -t {image} ~/.evonic/docker/tools')
+    return remember(
+        f'The sandbox backend cannot use Docker: {stderr or "docker image inspect failed"}. '
+        'The agent cannot read or write files until Docker is usable.')
+
 
 
 def _ensure_reaper_running() -> None:
@@ -446,6 +515,13 @@ def _get_or_create_container(
 
     if needs_destroy:
         _destroy_container(pool_key)
+
+    # PIT-373: without this the only report of a missing image was `docker run`
+    # trying a pull and failing seconds or minutes later, which the model
+    # narrated as "workspace down".  Name the fault before touching docker.
+    image_error = sandbox_image_error()
+    if image_error:
+        return None, image_error
 
     with _pool_lock:
         count = len(_containers)
