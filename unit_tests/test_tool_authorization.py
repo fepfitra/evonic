@@ -171,6 +171,20 @@ class TestToolAuthorization:
         if isinstance(result, dict):
             assert result.get("blocked_by") != "authorization"
 
+    def test_allows_plugin_tool_via_namespaced_id(self, registry):
+        """A plugin tool assigned as plugin:<id>:<fn> must pass the guard.
+
+        The DB stores the namespaced id (agent_tools.tool_id), so the bare
+        function name never matches and only the endswith check authorizes it.
+        """
+        ctx = self._context(["plugin:runts:runts"])
+        executor = registry.get_real_executor(ctx)
+        result = executor("runts", {"code": "1"})
+        if isinstance(result, dict):
+            assert result.get("blocked_by") != "authorization", (
+                f"Plugin tool was blocked: {result.get('error')}"
+            )
+
     # ------------------------------------------------------------------
     # Lazy skill authorization tests
     # ------------------------------------------------------------------
