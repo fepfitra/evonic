@@ -198,26 +198,6 @@ def _cors_enabled():
     cfg = plugin_manager.get_plugin_config('agentapi')
     return bool(cfg.get('DISABLE_CORS', False))
 
-def _apply_sandbox_exec(agent_id: str) -> None:
-    """Point this agent's tools at the sandbox machine the caller names (PIT-401).
-
-    The pitura dashboard holds a machine's per-session `/exec` endpoint and token
-    (minted at create, `server-rs/src/fly_machines.rs`), so it hands them to this
-    request instead of evonic being configured per machine. No headers = no
-    machine = the agent's own backend, which is how the docker path stays in
-    reach while this is proven.
-    """
-    from backend.tools.lib.backends.sandbox_exec_backend import (
-        clear_session, register_session,
-    )
-    url = (request.headers.get('X-Pitura-Exec-Url') or '').strip()
-    token = (request.headers.get('X-Pitura-Exec-Token') or '').strip()
-    if url and token:
-        register_session(agent_id, url, token)
-    else:
-        clear_session(agent_id)
-
-
 def _add_cors_headers(response):
     """Inject CORS headers into response when DISABLE_CORS is enabled."""
     if not _cors_enabled():
@@ -298,10 +278,15 @@ def create_blueprint():
         if not agent.get('is_super') and not agent.get('enabled', True):
             return jsonify({'error': f'Agent is disabled: {agent_id}'}), 503
 
-        # --- Sandbox tools (PIT-401) ---
-        # A caller that holds a sandbox machine's `/exec` names it here; every
-        # tool call in this turn then runs in the tree the preview serves.
-        _apply_sandbox_exec(agent_id)
+        # --- The machine this agent works in (PIT-408) ---
+        # A project agent is bound to its sandbox machine's `exec` workplace. When
+        # that machine is reaped the workplace is deleted in the same pass and the
+        # binding is left dangling on purpose: refusing here is the point, because
+        # the alternative is a tool call that quietly lands somewhere else.
+        from plugins.agentapi import sandbox_workplace
+        gap = sandbox_workplace.missing(agent)
+        if gap:
+            return jsonify({'error': gap}), 503
 
         # --- Build user message ---
         user_message = _build_user_message(messages)
@@ -623,6 +608,89 @@ def create_blueprint():
             'object': 'list',
             'data': models,
         })
+
+    # =======================================================================
+    # Sandbox machine ↔ workplace (PIT-408)
+    #
+    # The dashboard holds a machine's `/exec` endpoint and per-session token and
+    # has no evonic session, so the lifecycle it drives arrives here, on the one
+    # door its bearer token opens. The records are the ordinary workplaces the
+    # page renders (`routes/workplaces.py`) — nothing here is a second store.
+    # =======================================================================
+
+    def _agent_for_model(model: str, token_row: dict):
+        """(agent_id, (body, status)) for a caller that may use `model`."""
+        agent_id = _get_model_agent_map().get(model)
+        if not agent_id:
+            return None, ({'error': f'Unknown model: {model}'}, 400)
+        if not TokenDB.token_can_access_model(token_row, model):
+            return None, ({'error': f'Token not authorized for model: {model}'}, 403)
+        from models.db import db
+        if not db.get_agent(agent_id):
+            return None, ({'error': f'Agent not found: {agent_id}'}, 404)
+        return agent_id, None
+
+    @bp.route('/plugin/agentapi/v1/workplace', methods=['POST'])
+    def sandbox_workplace_open():
+        """Open, or re-point, the agent's `exec` workplace at a machine.
+
+        Body: `{model, name, url, token, workspace_path?}`. `name` is what the
+        operator sees (`<login>@<machine>`); `url`/`token` are that machine's
+        `/exec` endpoint and `SANDBOX_EXEC_TOKEN`. Answers 200 with the record.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        data = request.get_json(silent=True) or {}
+        model = (data.get('model') or '').strip()
+        agent_id, error = _agent_for_model(model, token_row)
+        if error:
+            body, status = error
+            return jsonify(body), status
+
+        name = (data.get('name') or '').strip()
+        url = (data.get('url') or '').strip()
+        machine_token = (data.get('token') or '').strip()
+        if not (name and url and machine_token):
+            return jsonify({'error': 'name, url and token are required'}), 400
+
+        from plugins.agentapi import sandbox_workplace
+        try:
+            record = sandbox_workplace.bind(agent_id, name, url, machine_token)
+        except Exception as e:
+            _logger.warning('[sandbox_workplace] bind failed for agent %s: %s', agent_id, e,
+                            exc_info=True)
+            return jsonify({'error': f'could not record the workplace: {e}'}), 503
+        return jsonify(record), 200
+
+    @bp.route('/plugin/agentapi/v1/workplace', methods=['DELETE'])
+    def sandbox_workplace_close():
+        """Close the agent's `exec` workplace — the machine it named is gone.
+
+        Body/query: `{model}`. Idempotent: an agent with no exec workplace answers
+        `{"closed": false}`, so the reap pass can call it for every project it
+        stops without reading the current bindings first.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        payload = request.get_json(silent=True) or {}
+        model = (payload.get('model') or request.args.get('model') or '').strip()
+        agent_id, error = _agent_for_model(model, token_row)
+        if error:
+            body, status = error
+            return jsonify(body), status
+
+        from plugins.agentapi import sandbox_workplace
+        try:
+            closed = sandbox_workplace.close(agent_id)
+        except Exception as e:
+            _logger.warning('[sandbox_workplace] close failed for agent %s: %s', agent_id, e,
+                            exc_info=True)
+            return jsonify({'error': f'could not close the workplace: {e}'}), 503
+        return jsonify({'closed': closed}), 200
 
     # =======================================================================
     # Admin endpoints — /api/ prefix → session auth via global enforce_auth
