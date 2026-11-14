@@ -136,6 +136,31 @@ class TestToolAuthorization:
         result = executor("bash", {})
         assert result.get("blocked_by") == "authorization"
 
+    def test_denial_names_the_agent(self, registry, caplog):
+        """A denial must name the calling agent, not '?'.
+
+        The runtime's agent_context carries the id under 'id' (runtime.py,
+        prefetch.py); ad-hoc callers of the guard pass 'agent_id'. Both must
+        reach the error and the log line, or a blocked tool cannot be traced
+        back to the agent that asked for it.
+        """
+        import logging
+
+        for ctx in ({"id": "kremas", "session_id": "kremas-f297cfea"},
+                    {"agent_id": "kremas", "session_id": "kremas-f297cfea"}):
+            with caplog.at_level(logging.WARNING, logger="backend.tools.registry"):
+                result = registry.get_real_executor(ctx)("runts", {"code": "1"})
+            assert result.get("blocked_by") == "authorization"
+            assert "'kremas'" in result.get("error", "")
+            assert "agent 'kremas'" in caplog.text
+            caplog.clear()
+
+    def test_denial_without_agent_identity_still_blocks(self, registry):
+        """A context with no identity at all stays fail-closed, and says so."""
+        result = registry.get_real_executor({"session_id": "s"})("runts", {})
+        assert result.get("blocked_by") == "authorization"
+        assert "'?'" in result.get("error", "")
+
     def test_tool_id_with_trailing_namespace(self, registry):
         """A tool whose ID ends with the function name via colon should match."""
         ctx = self._context(["skill:myplugin:custom_tool"])
@@ -145,6 +170,20 @@ class TestToolAuthorization:
         # attempt execution. If blocked, result will be a dict with 'blocked_by'.
         if isinstance(result, dict):
             assert result.get("blocked_by") != "authorization"
+
+    def test_allows_plugin_tool_via_namespaced_id(self, registry):
+        """A plugin tool assigned as plugin:<id>:<fn> must pass the guard.
+
+        The DB stores the namespaced id (agent_tools.tool_id), so the bare
+        function name never matches and only the endswith check authorizes it.
+        """
+        ctx = self._context(["plugin:runts:runts"])
+        executor = registry.get_real_executor(ctx)
+        result = executor("runts", {"code": "1"})
+        if isinstance(result, dict):
+            assert result.get("blocked_by") != "authorization", (
+                f"Plugin tool was blocked: {result.get('error')}"
+            )
 
     # ------------------------------------------------------------------
     # Lazy skill authorization tests

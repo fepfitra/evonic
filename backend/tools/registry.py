@@ -202,17 +202,25 @@ class ToolRegistry:
                         for tid in _assigned
                     )
                     if not _namespaced_match:
+                        # agent_context carries the id under 'id' (runtime.py,
+                        # prefetch.py); 'agent_id' is what ad-hoc callers pass.
+                        # Falling back to '?' made every real denial unattributable.
+                        _blocked_agent = (
+                            ctx.get('agent_id') or ctx.get('id') or '?')
                         _logger.warning(
                             "Authorization guard blocked tool '%s' for agent '%s' "
-                            "(session=%s user=%s): tool is not in assigned_tool_ids",
+                            "(session=%s user=%s): tool is not in assigned_tool_ids "
+                            "(%d assigned)",
                             function_name,
-                            ctx.get('agent_id', '?'),
+                            _blocked_agent,
                             ctx.get('session_id', '?'),
                             ctx.get('user_id', '?'),
+                            len(_assigned),
                         )
                         return {
                             "error": (
-                                f"Tool '{function_name}' is not assigned to this agent. "
+                                f"Tool '{function_name}' is not assigned to agent "
+                                f"'{_blocked_agent}'. "
                                 "Only explicitly assigned tools can be used."
                             ),
                             "blocked_by": "authorization",
