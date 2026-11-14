@@ -22,7 +22,7 @@ import queue
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 _logger = logging.getLogger(__name__)
 
@@ -278,6 +278,16 @@ def create_blueprint():
         if not agent.get('is_super') and not agent.get('enabled', True):
             return jsonify({'error': f'Agent is disabled: {agent_id}'}), 503
 
+        # --- The machine this agent works in (PIT-408) ---
+        # A project agent is bound to its sandbox machine's `exec` workplace. When
+        # that machine is reaped the workplace is deleted in the same pass and the
+        # binding is left dangling on purpose: refusing here is the point, because
+        # the alternative is a tool call that quietly lands somewhere else.
+        from plugins.agentapi import sandbox_workplace
+        gap = sandbox_workplace.missing(agent)
+        if gap:
+            return jsonify({'error': gap}), 503
+
         # --- Build user message ---
         user_message = _build_user_message(messages)
         if not user_message:
@@ -292,6 +302,14 @@ def create_blueprint():
 
         # --- Call agent ---
         from backend.agent_runtime import agent_runtime
+
+        # A message sent while the agent is mid-turn is injected into the
+        # running loop, and this endpoint answers `content: null` — an empty
+        # success the caller cannot tell from a silent agent. Refuse it with
+        # something actionable instead: 409, so a client can queue the message
+        # and retry when the turn ends (PIT-254).
+        if agent_runtime.is_agent_busy(agent_id):
+            return jsonify({'error': 'agent busy', 'session': external_user_id}), 409
 
         if stream:
             return _stream_response(token_row, agent_id, external_user_id,
@@ -592,6 +610,89 @@ def create_blueprint():
         })
 
     # =======================================================================
+    # Sandbox machine ↔ workplace (PIT-408)
+    #
+    # The dashboard holds a machine's `/exec` endpoint and per-session token and
+    # has no evonic session, so the lifecycle it drives arrives here, on the one
+    # door its bearer token opens. The records are the ordinary workplaces the
+    # page renders (`routes/workplaces.py`) — nothing here is a second store.
+    # =======================================================================
+
+    def _agent_for_model(model: str, token_row: dict):
+        """(agent_id, (body, status)) for a caller that may use `model`."""
+        agent_id = _get_model_agent_map().get(model)
+        if not agent_id:
+            return None, ({'error': f'Unknown model: {model}'}, 400)
+        if not TokenDB.token_can_access_model(token_row, model):
+            return None, ({'error': f'Token not authorized for model: {model}'}, 403)
+        from models.db import db
+        if not db.get_agent(agent_id):
+            return None, ({'error': f'Agent not found: {agent_id}'}, 404)
+        return agent_id, None
+
+    @bp.route('/plugin/agentapi/v1/workplace', methods=['POST'])
+    def sandbox_workplace_open():
+        """Open, or re-point, the agent's `exec` workplace at a machine.
+
+        Body: `{model, name, url, token, workspace_path?}`. `name` is what the
+        operator sees (`<login>@<machine>`); `url`/`token` are that machine's
+        `/exec` endpoint and `SANDBOX_EXEC_TOKEN`. Answers 200 with the record.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        data = request.get_json(silent=True) or {}
+        model = (data.get('model') or '').strip()
+        agent_id, error = _agent_for_model(model, token_row)
+        if error:
+            body, status = error
+            return jsonify(body), status
+
+        name = (data.get('name') or '').strip()
+        url = (data.get('url') or '').strip()
+        machine_token = (data.get('token') or '').strip()
+        if not (name and url and machine_token):
+            return jsonify({'error': 'name, url and token are required'}), 400
+
+        from plugins.agentapi import sandbox_workplace
+        try:
+            record = sandbox_workplace.bind(agent_id, name, url, machine_token)
+        except Exception as e:
+            _logger.warning('[sandbox_workplace] bind failed for agent %s: %s', agent_id, e,
+                            exc_info=True)
+            return jsonify({'error': f'could not record the workplace: {e}'}), 503
+        return jsonify(record), 200
+
+    @bp.route('/plugin/agentapi/v1/workplace', methods=['DELETE'])
+    def sandbox_workplace_close():
+        """Close the agent's `exec` workplace — the machine it named is gone.
+
+        Body/query: `{model}`. Idempotent: an agent with no exec workplace answers
+        `{"closed": false}`, so the reap pass can call it for every project it
+        stops without reading the current bindings first.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        payload = request.get_json(silent=True) or {}
+        model = (payload.get('model') or request.args.get('model') or '').strip()
+        agent_id, error = _agent_for_model(model, token_row)
+        if error:
+            body, status = error
+            return jsonify(body), status
+
+        from plugins.agentapi import sandbox_workplace
+        try:
+            closed = sandbox_workplace.close(agent_id)
+        except Exception as e:
+            _logger.warning('[sandbox_workplace] close failed for agent %s: %s', agent_id, e,
+                            exc_info=True)
+            return jsonify({'error': f'could not close the workplace: {e}'}), 503
+        return jsonify({'closed': closed}), 200
+
+    # =======================================================================
     # Admin endpoints — /api/ prefix → session auth via global enforce_auth
     # =======================================================================
 
@@ -769,5 +870,67 @@ def create_blueprint():
     def admin_model_agent_map():
         """Return the current MODEL_AGENT_MAP for the admin UI."""
         return jsonify({'map': _get_model_agent_map()})
+
+    @bp.route('/plugin/agentapi/v1/usage', methods=['GET'])
+    def api_usage():
+        """Self-serve usage for the calling bearer token.
+
+        Returns the API-token quota (request count) plus the LLM token usage
+        for the agent(s) this token can reach (via MODEL_AGENT_MAP), so the
+        client dashboard can show used/limit visibility.
+        """
+        token_row, err = _validate_bearer_token()
+        if err:
+            return jsonify(err[0]), err[1]
+
+        quota_limit = token_row.get('quota_limit')
+        quota_used = token_row.get('quota_used', 0)
+
+        # LLM token usage — sum across agents this token can reach.
+        # Prefer the single mapped agent; fall back to all allowed models.
+        model_agent_map = _get_model_agent_map()
+        agent_ids = []
+        allowed = _parse_allowed_models(token_row.get('allowed_models'))
+        if allowed == ['*']:
+            # Token can reach every agent — sum usage across all mapped agents.
+            agent_ids = list(dict.fromkeys(model_agent_map.values()))
+        else:
+            agent_ids = [model_agent_map.get(m) for m in allowed if m in model_agent_map]
+        agent_ids = [a for a in dict.fromkeys(agent_ids) if a]
+
+        used_today = 0
+        limit_daily = None
+        from plugins.token_monitor.db import usage_db
+        now_utc = datetime.now(timezone.utc)
+        day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        next_midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        for aid in agent_ids:
+            t = usage_db.agent_total_tokens(aid, since_iso=day_start)
+            if t is not None:
+                used_today += t
+        if agent_ids:
+            from models.db import db as _db
+            _agent = _db.get_agent(agent_ids[0])
+            if _agent:
+                limit_daily = _agent.get('token_limit_daily')
+                if limit_daily is None:
+                    import os as _os
+                    try:
+                        limit_daily = int(_os.environ.get('EVONIC_TOKEN_LIMIT_DAILY_DEFAULT', '500000') or '500000')
+                    except (TypeError, ValueError):
+                        limit_daily = 500000
+
+        return jsonify({
+            'quota': {
+                'limit': quota_limit,
+                'used': quota_used,
+            },
+            'llm_tokens': {
+                'used_today': used_today,
+                'limit_daily': limit_daily,
+                'agents': agent_ids,
+                'reset_at': next_midnight.isoformat(),
+            },
+        })
 
     return bp

@@ -57,8 +57,8 @@ def api_create_workplace():
 
     if not name:
         return jsonify({'error': 'name is required'}), 400
-    if workplace_type not in ('local', 'remote', 'tunnel', 'bwrap'):
-        return jsonify({'error': 'type must be local, remote, tunnel, or bwrap'}), 400
+    if workplace_type not in ('local', 'remote', 'tunnel', 'bwrap', 'exec'):
+        return jsonify({'error': 'type must be local, remote, tunnel, bwrap, or exec'}), 400
 
     config = data.get('config', {})
     if isinstance(config, str):
@@ -105,6 +105,15 @@ def api_update_workplace(workplace_id):
 
     if updates:
         db.update_workplace(workplace_id, updates)
+        if 'config' in updates:
+            # A re-pointed workplace must not answer with the backend built from
+            # its previous config (PIT-408: a rebuild names a new machine, and
+            # the manager caches one backend per workplace id).
+            try:
+                from backend.workplaces.manager import workplace_manager
+                workplace_manager.disconnect(workplace_id)
+            except Exception:
+                pass
     return jsonify(db.get_workplace(workplace_id))
 
 

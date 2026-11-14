@@ -237,6 +237,18 @@ SANDBOX_BWRAP_ULIMIT_V_MB = _get_env_int("SANDBOX_BWRAP_ULIMIT_V_MB", 0, min_val
 # SSH backend configuration (used by RemoteWorkplace / portals / SSHBackend)
 SSH_DEFAULT_TIMEOUT = _get_env_int("SSH_DEFAULT_TIMEOUT", 30, min_val=1, max_val=3600)   # seconds per command
 SSH_IDLE_TIMEOUT = _get_env_int("SSH_IDLE_TIMEOUT", 1800, min_val=1, max_val=43200)       # 30 min idle disconnect
+# A dead host must fail in seconds, not sit on the kernel's TCP retransmit
+# buffer (~130 s) before the tool returns anything.  Paramiko's timeout covers
+# TCP connect; banner_timeout and auth_timeout bound the rest of the handshake.
+# 10 s because a healthy tailnet handshake to the pitura VPS measured 3.65 s
+# here: a bound a working host can trip is worse than a slow failure (PIT-373).
+SSH_CONNECT_TIMEOUT = _get_env_int("SSH_CONNECT_TIMEOUT", 10, min_val=1, max_val=300)
+# How long a cached "sandbox image is present" answer is trusted, and how long
+# the `docker image inspect` probe may take.  A negative answer is re-checked
+# three times sooner so a manual rebuild is picked up without a restart.
+SANDBOX_IMAGE_CHECK_TTL = _get_env_int("SANDBOX_IMAGE_CHECK_TTL", 60, min_val=1, max_val=3600)
+SANDBOX_IMAGE_CHECK_TIMEOUT = _get_env_int(
+    "SANDBOX_IMAGE_CHECK_TIMEOUT", 5, min_val=1, max_val=60)
 
 # Tunnel Workplace connector relay (WebSocket server for Evonet)
 CONNECTOR_WS_HOST = os.getenv("CONNECTOR_WS_HOST", "0.0.0.0")

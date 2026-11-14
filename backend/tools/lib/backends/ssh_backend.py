@@ -20,6 +20,12 @@ from backend.tools.lib.process_tracker import process_tracker
 
 logger = logging.getLogger(__name__)
 
+try:
+    from config import SSH_CONNECT_TIMEOUT
+except ImportError:
+    SSH_CONNECT_TIMEOUT = 10
+
+
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _MAX_RETRIES = 5
 
@@ -65,7 +71,12 @@ class SSHBackend(ExecutionBackend):
             hostname=self._host,
             port=self._port,
             username=self._username,
-            timeout=300,
+            # PIT-373: this was 300 s, so an unreachable host sat on the kernel's
+            # SYN-retry budget (~130 s) per tool call while the model guessed at
+            # the cause.  Bound the whole handshake instead.
+            timeout=SSH_CONNECT_TIMEOUT,
+            banner_timeout=SSH_CONNECT_TIMEOUT,
+            auth_timeout=SSH_CONNECT_TIMEOUT,
         )
 
         if self._password:
@@ -85,7 +96,15 @@ class SSHBackend(ExecutionBackend):
             kwargs['look_for_keys'] = True
             kwargs['allow_agent'] = True
 
-        self._client.connect(**kwargs)
+        try:
+            self._client.connect(**kwargs)
+        except Exception as e:
+            # PIT-373: name the host, the failure and the bound, so the tool
+            # result cannot be read as a mystery "workspace down".
+            raise RuntimeError(
+                f'SSH connect to {self._username}@{self._host}:{self._port} '
+                f'failed within {SSH_CONNECT_TIMEOUT}s: {type(e).__name__}: {e}'
+            ) from e
         self._client.get_transport().set_keepalive(15)
         self._connected_at = time.time()
         self._last_used = time.time()
