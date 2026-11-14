@@ -166,6 +166,73 @@ def _generate_external_user_id(token_row: dict, agent_id: str, request) -> str:
     token_part = token_row.get('token_hash', '')[:16]
     return f"api:{token_part}:{agent_id}"
 
+EXEC_URL_HEADER = 'X-Pitura-Exec-Url'
+EXEC_TOKEN_HEADER = 'X-Pitura-Exec-Token'
+
+
+def _exec_workplace_id(agent_id: str) -> str:
+    """Stable workplace id for an agent's sandbox machine (`exec-<8 hex>`)."""
+    return 'exec-' + hashlib.sha1(agent_id.encode('utf-8')).hexdigest()[:8]
+
+
+def _workplace_config(row: dict) -> dict:
+    """A workplace row's `config` as a dict (the column holds JSON text)."""
+    raw = row.get('config')
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _apply_sandbox_exec(agent: dict) -> None:
+    """Point this agent's tools at the sandbox machine the caller names (PIT-401).
+
+    The dashboard's chat proxy sends the machine's `POST /exec` endpoint and the
+    token it minted when it created that machine (`server-rs/src/agent.rs`
+    `exec_headers`), so a tool call edits the checkout the preview serves instead
+    of a second copy of the project. Both headers absent is the normal case for
+    every other client and changes nothing — the agent keeps its workplace.
+
+    One machine per project, one agent per project, so the workplace row is
+    derived from the agent id and rewritten in place when the machine is
+    replaced (new url, new token) rather than accumulating dead rows.
+    """
+    url = (request.headers.get(EXEC_URL_HEADER) or '').strip()
+    token = (request.headers.get(EXEC_TOKEN_HEADER) or '').strip()
+    if not (url and token):
+        return
+
+    from models.db import db
+
+    # The Docker sandbox wraps the whole tool call and wins over the workplace,
+    # so an exec workplace here would be silently ignored. Say it out loud
+    # instead of letting the agent edit a tree the preview never sees.
+    if agent.get('sandbox_enabled'):
+        _logger.warning(
+            "agent %s was handed a sandbox exec endpoint but its Docker sandbox "
+            "is enabled; the machine is not used", agent.get('id'))
+        return
+
+    wp_id = _exec_workplace_id(agent['id'])
+    config = {'url': url, 'token': token}
+    name = "Sandbox machine (%s)" % (agent.get('name') or agent['id'])
+    existing = db.get_workplace(wp_id)
+    if existing is None:
+        db.create_workplace({'id': wp_id, 'name': name, 'type': 'exec', 'config': config})
+    elif _workplace_config(existing) != config:
+        db.update_workplace(wp_id, {'config': config, 'status': 'disconnected',
+                                    'error_msg': None})
+    if agent.get('workplace_id') != wp_id:
+        db.update_agent(agent['id'], {'workplace_id': wp_id})
+        # This turn's tool calls read the caller's copy of the row.
+        agent['workplace_id'] = wp_id
+
+
 def _format_openai_response(content: str, model: str,
                             usage: dict = None) -> dict:
     """Build an OpenAI-compatible chat completion response."""
@@ -285,6 +352,11 @@ def create_blueprint():
 
         # --- Build external_user_id ---
         external_user_id = _generate_external_user_id(token_row, agent_id, request)
+
+        # --- PIT-401: tools run in the sandbox machine the caller names ---
+        # Before the turn starts, so every tool call in it lands in the tree the
+        # preview serves. No headers = nothing changes.
+        _apply_sandbox_exec(agent)
 
         # Sessions are stateful by default — Evonic manages history &
         # auto-summarization. Use X-Session-Id to isolate conversations.
