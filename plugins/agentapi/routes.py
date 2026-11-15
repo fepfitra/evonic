@@ -15,6 +15,7 @@ Admin endpoints (/api/ prefix → session auth required):
 """
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -46,6 +47,54 @@ _PLAINTEXT_CACHE_TTL = 3600  # seconds
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+# One tool result travels through SSE and into `chat_turn_events`, so a 5 MB
+# build log is cut here rather than stored.
+_TOOL_RESULT_LIMIT = 2048
+
+def _tool_result_text(result) -> str:
+    """Text for a tool result: an error message when there is one, else the
+    output — compact JSON for dicts, capped at 2 KB with a `… (+N bytes)` tail."""
+    if result is None:
+        return ''
+    if isinstance(result, dict):
+        err = result.get('error')
+        if isinstance(err, str) and err:
+            text = err
+        else:
+            text = json.dumps(result, ensure_ascii=False)
+    elif isinstance(result, str):
+        text = result
+    else:
+        text = json.dumps(result, ensure_ascii=False)
+    raw = text.encode('utf-8')
+    if len(raw) <= _TOOL_RESULT_LIMIT:
+        return text
+    cut = raw[:_TOOL_RESULT_LIMIT].decode('utf-8', 'ignore')
+    return cut + f'\u2026 (+{len(raw) - len(cut.encode("utf-8"))} bytes)'
+
+def _tool_call_frames(call_id: str, data: dict) -> list:
+    """The three SSE records for one finished tool call (PIT-431).
+
+    One call is one transcript row: `tool_use` names it, `tool_args` carries the
+    JSON it was called with, `tool_result` its output. They share `call_id`, so
+    two calls with the same tool name stay two rows. Arguments are omitted when
+    the call had none, and a result is only the truncated text — the record is
+    not a notification and cannot be merged with its neighbour.
+    """
+    frames = [('tool_use', {'id': call_id, 'name': data.get('tool_name', '')})]
+    args = data.get('tool_args') or {}
+    if args:
+        frames.append(('tool_args', {
+            'id': call_id,
+            'delta': json.dumps(args, ensure_ascii=False),
+        }))
+    frames.append(('tool_result', {
+        'id': call_id,
+        'content': _tool_result_text(data.get('tool_result')),
+        'is_error': bool(data.get('has_error')),
+    }))
+    return frames
 
 def _parse_allowed_models(raw) -> list:
     """Parse allowed_models from DB storage (JSON string or '*')."""
@@ -409,41 +458,20 @@ def create_blueprint():
                 return
             q.put_nowait((_SENTINEL, None))
 
-        # Tool-call notifications: coalesce tool_executed events within a short
-        # window into one SSE event (mirrors the Telegram channel's coalescing).
-        # A 100-tool loop collapses to a handful of lines, not one per call.
-        _tool_pending: dict = {}  # session_id -> {last, counts: {name: n}, any_error}
-        _TOOL_WINDOW = 5.0
-
-        def _flush_tool_notify(sid: str):
-            entry = _tool_pending.pop(sid, None)
-            if not entry:
-                return
-            parts = [f"{name} ({n}x)" for name, n in sorted(entry['counts'].items())]
-            q.put_nowait(('tool', {
-                'tool_name': ', '.join(parts),
-                'has_error': entry['any_error'],
-            }))
+        # Tool calls (PIT-431): one transcript record per call, not a coalesced
+        # notification. A card needs the call's own id, its arguments and its
+        # output; the coalesced label `bash (1x), read_file (1x)` has none of
+        # those and merges two different calls into one row. The Telegram
+        # channel keeps its own coalescer (backend/channels/telegram.py), so
+        # one line per burst there is unchanged.
+        _tool_seq = itertools.count(1)
 
         def on_tool_executed(data):
             if data.get('session_id') != session_id:
                 return
-            now = time.time()
-            entry = _tool_pending.get(session_id)
-            if entry and now - entry['last'] < _TOOL_WINDOW:
-                name = data.get('tool_name', '')
-                entry['counts'][name] = entry['counts'].get(name, 0) + 1
-                entry['any_error'] = entry['any_error'] or data.get('has_error', False)
-                entry['last'] = now
-                return
-            if entry:
-                _flush_tool_notify(session_id)
-            _tool_pending[session_id] = {
-                'last': now,
-                'counts': {data.get('tool_name', ''): 1},
-                'any_error': data.get('has_error', False),
-            }
-            threading.Timer(_TOOL_WINDOW, _flush_tool_notify, args=[session_id]).start()
+            call_id = f"call-{next(_tool_seq)}"
+            for frame in _tool_call_frames(call_id, data):
+                q.put_nowait(frame)
 
         # Thread to run the agent and forward chunks via event_stream
         events_registered = []
@@ -497,19 +525,6 @@ def create_blueprint():
                         continue
 
                     if item[0] is _SENTINEL:
-                        # Turn complete: flush any pending coalesced tool events
-                        # (the 5s window may not have elapsed yet). Yield them
-                        # directly — the queue loop is about to exit, so a
-                        # put_nowait'd item would never be consumed.
-                        entry = _tool_pending.pop(session_id, None)
-                        if entry:
-                            parts = [f"{name} ({n}x)" for name, n in sorted(entry['counts'].items())]
-                            tool_event = {
-                                'type': 'tool',
-                                'tool_name': ', '.join(parts),
-                                'has_error': entry['any_error'],
-                            }
-                            yield f"data: {json.dumps(tool_event)}\n\n"
                         break
 
                     event_type, payload = item
@@ -526,17 +541,15 @@ def create_blueprint():
                             }],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
-                    elif event_type == 'tool':
-                        # Tool-call notification: a compact line like
-                        #   {"type":"tool","tool_name":"bash (2x), python (1x)","has_error":false}
-                        # Streamed inline so the client can show it in the chat
-                        # while the agent keeps working.
-                        tool_event = {
-                            'type': 'tool',
-                            'tool_name': payload.get('tool_name', ''),
-                            'has_error': payload.get('has_error', False),
-                        }
-                        yield f"data: {json.dumps(tool_event)}\n\n"
+                    elif event_type in ('tool_use', 'tool_args', 'tool_result'):
+                        # A tool transcript record (PIT-431): the call's own id,
+                        # then its arguments, then its output —
+                        #   {"type":"tool_use","id":"call-1","name":"bash"}
+                        #   {"type":"tool_args","id":"call-1","delta":"{\"cmd\":\"ls\"}"}
+                        #   {"type":"tool_result","id":"call-1","content":"a\\nb","is_error":false}
+                        # The id is what the client groups the three by; two
+                        # calls that share a name stay two records.
+                        yield f"data: {json.dumps({'type': event_type, **payload})}\n\n"
 
                 # Send final [DONE] chunk
                 final_chunk = {
