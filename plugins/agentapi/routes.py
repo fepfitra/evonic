@@ -753,6 +753,9 @@ def create_blueprint():
         for d in (os.path.join(AGENTS_DIR, agent_id),
                   os.path.join(WORKSPACE_DIR, agent_id)):
             shutil.rmtree(d, ignore_errors=True)
+        # A purge that leaves no trace cannot be told apart from rows that
+        # vanished: log every one, including the rollback path's.
+        _logger.info('[provision] agent %s: purged (removed=%s)', agent_id, removed)
         return removed
 
     # What a project agent is told: generic engineering discipline plus the two
@@ -870,10 +873,14 @@ site, and a turn's edits are committed there for you. Use relative paths.
 
         from models.db import db
         removed = _purge_agent(agent_id)
+        dropped = 0
         for t in token_db.list_tokens():
             if t.get('name') == f'pitura:{agent_id}':
                 token_db.delete_token(t['id'])
+                dropped += 1
         _write_model_alias(agent_id, None)
+        _logger.info('[provision] project %s: deprovisioned, agent removed=%s, %d token(s)',
+                     slug, removed, dropped)
         return jsonify({'removed': removed}), 200
 
     # =======================================================================
