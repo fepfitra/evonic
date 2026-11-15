@@ -147,6 +147,49 @@ If the token has `allowed_models: ["*"]`, all configured models are returned.
 
 ---
 
+### `POST|DELETE /plugin/agentapi/v1/provision`
+
+Create (or remove) an agent for an external platform that has no evonic session —
+the one agent-shaped thing a project needs, minted through the door the caller's
+bearer token already opens. Used by the Pitura dashboard's instant create
+(`server-rs/src/create_project.rs` `Provisioner`).
+
+**Fleet token only.** A token whose `allowed_models` is a list is scoped to
+existing agents and answers `403` here, so a leaked project token cannot make
+new agents.
+
+**Request (POST):**
+
+```bash
+curl -X POST http://localhost:8080/plugin/agentapi/v1/provision \
+  -H "Authorization: Bearer ***" \
+  -H "Content-Type: application/json" \
+  -d '{"slug": "warung-bu-tini", "name": "Warung Bu Tini", "source": "demo"}'
+```
+
+`slug` is the platform's project subdomain (lowercase alnum and hyphens); the
+agent id is that slug with `-` → `_` (evonic ids are `^[a-z0-9_]+$`) and the
+model alias is the agent id. `source` names the agent whose settings and tool
+set are cloned; default `demo`.
+
+**Response (201):**
+
+```json
+{"agent_id": "warung_bu_tini", "model": "warung_bu_tini", "token": "…43 chars…"}
+```
+
+The token is plaintext, scoped to `[model]`, and returned **once** — the caller
+stores it. `409` when the agent id already exists (an agent belongs to one
+project, so the caller rolls back instead of adopting it), `400` for a bad slug
+or an unknown `source`.
+
+**Delete:** `{"slug": "warung-bu-tini"}` (body or `?slug=`) answers
+`{"removed": true|false}` and is idempotent; it also drops the agent's token,
+its `MODEL_AGENT_MAP` alias and its directories — the rollback for a create
+that failed after the agent existed.
+
+---
+
 ## Admin Endpoints
 
 These endpoints use the **web session** authentication (cookies) — the same session used when logged into the Evonic admin panel.

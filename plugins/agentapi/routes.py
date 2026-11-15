@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import queue
+import re
+import shutil
 import threading
 import time
 import uuid
@@ -35,6 +37,11 @@ from plugins.agentapi.db import TokenDB, hash_token
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 token_db = TokenDB()
+
+# A Pitura project subdomain, the same shape the dashboard validates
+# (`server-rs/src/create_project.rs` `check_slug`): the provisioning call carries
+# it, so it is checked again here rather than trusted.
+_PROJECT_SLUG_RE = re.compile(r'^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$')
 
 # In-memory cache: maps token_id → plaintext (for the /reveal endpoint)
 _plaintext_cache: dict[int, str] = {}
@@ -691,6 +698,170 @@ def create_blueprint():
                             exc_info=True)
             return jsonify({'error': f'could not close the workplace: {e}'}), 503
         return jsonify({'closed': closed}), 200
+
+    # =======================================================================
+    # Provisioning (PIT-430) — the agent a new project chats with
+    # =======================================================================
+    # A dashboard create must answer with a project that can chat on its first
+    # turn, and the dashboard holds no evonic session — only this plugin's
+    # bearer tokens. So the one agent-shaped thing a create needs (an agent, its
+    # model alias, its token) is minted here: same door as the workplace route
+    # above, same reason. Only the fleet token (`allowed_models: "*"`) may
+    # provision; a project token is scoped to one model and is refused, so a
+    # leaked project token cannot make agents.
+
+    def _is_fleet_token(token_row: dict) -> bool:
+        return token_row.get('allowed_models') in (None, '', '*')
+
+    def _write_model_alias(model: str, agent_id):
+        """Point, or unpoint, a model name at an agent in MODEL_AGENT_MAP."""
+        from models.db import db
+        cfg = _get_model_agent_map()
+        if agent_id is None:
+            cfg.pop(model, None)
+        else:
+            cfg[model] = agent_id
+        db.set_setting('plugin_config:agentapi:MODEL_AGENT_MAP',
+                       json.dumps(cfg, indent=2, sort_keys=True))
+
+    def _purge_agent(agent_id: str) -> bool:
+        """Remove an agent and every row that outlives its `agents` row.
+
+        `db.delete_agent` deletes the agents table row and nothing else, so a
+        re-provision of the same slug would collide on `agent_tools`; and the
+        agent's own tree only goes with its directories.
+        """
+        from models.db import db
+        from routes.agents import AGENTS_DIR, WORKSPACE_DIR
+        db.set_agent_tools(agent_id, [])
+        db.set_agent_skills(agent_id, [])
+        db.set_agent_variables_bulk(agent_id, [])
+        removed = bool(db.get_agent(agent_id)) and db.delete_agent(agent_id)
+        for d in (os.path.join(AGENTS_DIR, agent_id),
+                  os.path.join(WORKSPACE_DIR, agent_id)):
+            shutil.rmtree(d, ignore_errors=True)
+        return removed
+
+    # What a project agent is told: generic engineering discipline plus the two
+    # facts that are this site's (its project and the tree it works in). The
+    # source agent's own prose is not copied — `demo`'s names its repo, its
+    # deploy pipeline and a content file a new site does not have.
+    PROJECT_PROMPT = """You are the engineer for {name}, a Pitura site (project `{slug}`).
+
+You work in `/workspace` inside the project's machine — that checkout is the
+site, and a turn's edits are committed there for you. Use relative paths.
+
+## Guidelines
+
+- Always git commit after completing a task, unless explicitly told not to, and
+  report the commit hash. Stage files explicitly; never `git add -A` or `.`.
+- Make sure you only commit the changes you just made.
+- Do not push git unless explicitly asked.
+- Always do a sanity check after a coding task: verify the change took effect
+  and report what you verified.
+- If a task is ambiguous or the workspace differs from what you expected, say so
+  instead of guessing.
+- Your site's repository on the Pitura host is /srv/clients/{slug}.
+"""
+
+    @bp.route('/plugin/agentapi/v1/provision', methods=['POST'])
+    def provision_agent():
+        """Create a project's agent and mint its token.
+
+        Body: `{slug, name, source?}`. `slug` is the project's subdomain; the
+        agent id is that slug with `-` → `_` (evonic ids are `^[a-z0-9_]+$`) and
+        the model alias is the agent id, which is what the dashboard sends as
+        the chat `model`. `source` names the agent whose tool set and settings
+        are cloned, default `demo`.
+
+        Answers `201 {agent_id, model, agent_url_hint, token}` — `token` is the
+        plaintext bearer token, the only time it exists. `409` when the agent id
+        is already taken: an agent is a project's, so a create that collides is
+        a create that must roll back, not one that adopts a stranger's agent.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        if not _is_fleet_token(token_row):
+            return jsonify({'error': 'provisioning needs a fleet token'}), 403
+
+        data = request.get_json(silent=True) or {}
+        slug = (data.get('slug') or '').strip().lower()
+        name = (data.get('name') or '').strip() or slug
+        source = (data.get('source') or 'demo').strip()
+        if not slug or not _PROJECT_SLUG_RE.match(slug):
+            return jsonify({'error': 'slug must be a project slug'}), 400
+        agent_id = slug.replace('-', '_')
+
+        from models.db import db
+        if db.get_agent(agent_id):
+            return jsonify({'error': f"agent '{agent_id}' already exists"}), 409
+        if not db.get_agent(source):
+            return jsonify({'error': f"source agent '{source}' not found"}), 400
+
+        try:
+            db.clone_agent(source, agent_id, name, f"Pitura site {slug}")
+            prompt = PROJECT_PROMPT.format(name=name, slug=slug)
+            # SYSTEM.md is what the runtime reads (`routes/agents.py`
+            # `_read_system_prompt`); `update_agent` refuses `system_prompt`
+            # (its allowed set), so the file is the one place it is written.
+            from routes.agents import WORKSPACE_DIR, _write_system_prompt
+            _write_system_prompt(agent_id, prompt)
+            os.makedirs(os.path.join(WORKSPACE_DIR, agent_id), exist_ok=True)
+        except Exception as e:  # noqa: BLE001 - a half-made agent must not stay
+            _logger.warning('[provision] %s: could not create agent: %s', slug, e,
+                            exc_info=True)
+            try:
+                _purge_agent(agent_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return jsonify({'error': f'could not create the agent: {e}'}), 500
+
+        row = token_db.create_token({
+            'name': f'pitura:{agent_id}',
+            'allowed_models': [agent_id],
+        })
+        if not row or not row.get('token'):
+            db.delete_agent(agent_id)
+            return jsonify({'error': 'could not mint the agent token'}), 500
+        _write_model_alias(agent_id, agent_id)
+        _logger.info('[provision] project %s: agent %s + token %s',
+                     slug, agent_id, row.get('token_prefix'))
+        return jsonify({
+            'agent_id': agent_id,
+            'model': agent_id,
+            'token': row['token'],
+        }), 201
+
+    @bp.route('/plugin/agentapi/v1/provision', methods=['DELETE'])
+    def deprovision_agent():
+        """Remove a project's agent, its token and its model alias.
+
+        Body/query: `{slug}`. Idempotent — a create that rolled back before the
+        agent existed, or a retry, answers `{"removed": false}` rather than an
+        error.
+        """
+        token_row, error = _validate_bearer_token()
+        if error:
+            body, status = error
+            return jsonify(body), status
+        if not _is_fleet_token(token_row):
+            return jsonify({'error': 'provisioning needs a fleet token'}), 403
+
+        payload = request.get_json(silent=True) or {}
+        slug = (payload.get('slug') or request.args.get('slug') or '').strip().lower()
+        if not slug or not _PROJECT_SLUG_RE.match(slug):
+            return jsonify({'error': 'slug must be a project slug'}), 400
+        agent_id = slug.replace('-', '_')
+
+        from models.db import db
+        removed = _purge_agent(agent_id)
+        for t in token_db.list_tokens():
+            if t.get('name') == f'pitura:{agent_id}':
+                token_db.delete_token(t['id'])
+        _write_model_alias(agent_id, None)
+        return jsonify({'removed': removed}), 200
 
     # =======================================================================
     # Admin endpoints — /api/ prefix → session auth via global enforce_auth
